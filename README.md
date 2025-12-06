@@ -16,7 +16,11 @@ npx tsx run.ts my-project --instruction "Build a REST API for managing todos"
 # Environment variables
 export GITHUB_OWNER=your-username    # Used to derive repo URL
 export GITHUB_TOKEN=ghp_xxx          # Required for private repos
-export ANTHROPIC_API_KEY=sk-xxx      # Required
+
+# Authentication (choose one):
+export ANTHROPIC_API_KEY=sk-xxx      # Option 1: API key
+# OR use OAuth credentials (Option 2):
+# Place .claude-code-credentials.json in the repo root, or use --claude-oauth-file
 ```
 
 ## How It Works
@@ -139,7 +143,34 @@ Options:
   --timeout <secs>         Timeout seconds (default: 3600)
   --repo-url <url>         GitHub repo URL
   --branch <branch>        Git branch (default: main)
+  --claude-oauth-file <f>  Path to Claude Code OAuth credentials JSON
+                           (default: ./.claude-code-credentials.json)
 ```
+
+## Authentication
+
+Looper supports two authentication methods for the Claude Agent SDK:
+
+1. **API Key** (traditional): Set `ANTHROPIC_API_KEY` environment variable
+2. **OAuth Credentials** (recommended for Claude Code): Place `.claude-code-credentials.json` in the repo root, or use `--claude-oauth-file` flag
+
+The OAuth credentials file should contain JSON in this format:
+```json
+{
+  "claudeAiOauth": {
+    "accessToken": "...",
+    "refreshToken": "...",
+    "expiresAt": 1234567890,
+    "scopes": ["user:inference", "user:profile", "user:sessions:claude_code"],
+    "subscriptionType": "pro",
+    "rateLimitTier": "default_claude_ai"
+  }
+}
+```
+
+When OAuth credentials are provided, they take precedence over `ANTHROPIC_API_KEY`. The credentials are securely injected into the Modal sandbox and written to `/home/looper/.config/claude/.credentials.json` where the SDK can automatically discover them (via `CLAUDE_CONFIG_DIR` environment variable).
+
+**Note:** The `.claude-code-credentials.json` file is automatically added to `.gitignore` to prevent accidental commits.
 
 ## Modal Integration
 

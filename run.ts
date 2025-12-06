@@ -13,11 +13,12 @@
  *   --cpu <cores>          CPU cores (default: 1.0)
  *   --memory <mb>          Memory in MB (default: 2048)
  *   --timeout <secs>       Timeout in seconds (default: 3600)
+ *   --claude-oauth-file <f> Path to Claude Code OAuth credentials JSON (default: ./.claude-code-credentials.json)
  *
  * Environment:
  *   GITHUB_OWNER           Used to derive repo URL
  *   GITHUB_TOKEN           Required for private repos
- *   ANTHROPIC_API_KEY      Required
+ *   ANTHROPIC_API_KEY      Required if OAuth credentials not provided
  */
 
 import "dotenv/config";
@@ -37,6 +38,8 @@ interface Config {
   branch: string;
   githubToken?: string;
   anthropicApiKey?: string;
+  claudeOAuthFile?: string;
+  claudeOAuthCredentials?: string;
 }
 
 // Detect if running inside Modal sandbox
@@ -68,9 +71,15 @@ async function runInModal() {
     process.exit(1);
   }
 
-  if (!config.anthropicApiKey) {
-    console.error("Error: ANTHROPIC_API_KEY is required\n");
+  if (!config.anthropicApiKey && !config.claudeOAuthCredentials) {
+    console.error("Error: Either ANTHROPIC_API_KEY or --claude-oauth-file is required\n");
     process.exit(1);
+  }
+
+  if (config.claudeOAuthCredentials) {
+    console.log(`[Looper] Using Claude Code OAuth credentials from ${config.claudeOAuthFile ?? "./.claude-code-credentials.json"}`);
+  } else {
+    console.log(`[Looper] Using ANTHROPIC_API_KEY for authentication`);
   }
 
   console.log(`[Looper] Project: ${config.projectName}`);
@@ -104,7 +113,12 @@ async function runInModal() {
 
   const secretEntries: Record<string, string> = {};
   if (config.githubToken) secretEntries.GITHUB_TOKEN = config.githubToken;
-  if (config.anthropicApiKey) secretEntries.ANTHROPIC_API_KEY = config.anthropicApiKey;
+  if (config.anthropicApiKey && !config.claudeOAuthCredentials) {
+    secretEntries.ANTHROPIC_API_KEY = config.anthropicApiKey;
+  }
+  if (config.claudeOAuthCredentials) {
+    secretEntries.CLAUDE_CODE_CREDENTIALS_JSON = config.claudeOAuthCredentials;
+  }
 
   const secrets = Object.keys(secretEntries).length > 0
     ? [await client.secrets.fromObject(secretEntries)]
@@ -127,6 +141,7 @@ async function runInModal() {
       WORKSPACE_DIR: projectDir,
       MAX_SESSIONS: String(config.sessions),
       LOOPER_STOP_FILE: STOP_FILE_PATH,
+      ...(config.claudeOAuthCredentials ? { CLAUDE_CONFIG_DIR: "/home/looper/.config/claude" } : {}),
     },
     secrets,
   });
@@ -172,6 +187,9 @@ async function runInModal() {
     process.exitCode = result.exitCode;
   } finally {
     process.off("SIGINT", handleSigint);
+    if (config.claudeOAuthCredentials && config.claudeOAuthFile) {
+      await syncCredentialsFromSandbox(sandbox, config.claudeOAuthFile);
+    }
     if (!sandboxTerminated) {
       await sandbox.terminate();
     }
@@ -225,6 +243,63 @@ async function requestGracefulStop(sandbox: Sandbox) {
     console.log("[Looper] Requested graceful shutdown after current session.");
   } catch (err) {
     console.warn("[Looper] Failed to signal graceful shutdown:", err);
+  }
+}
+
+async function syncCredentialsFromSandbox(sandbox: Sandbox, localCredentialsFile: string) {
+  try {
+    const credentialsPath = "/home/looper/.config/claude/.credentials.json";
+    const localPath = path.isAbsolute(localCredentialsFile)
+      ? localCredentialsFile
+      : path.resolve(process.cwd(), localCredentialsFile);
+    
+    const result = await exec(sandbox, `cat '${credentialsPath}' 2>/dev/null || echo ""`, "/", {});
+    
+    if (result.exitCode !== 0 || !result.stdout.trim()) {
+      console.log("[Looper] No credentials file found in sandbox to sync.");
+      return;
+    }
+
+    const sandboxCredentials = result.stdout.trim();
+    
+    let sandboxParsed: { claudeAiOauth?: { accessToken: string; expiresAt: number } };
+    try {
+      sandboxParsed = JSON.parse(sandboxCredentials);
+      if (!sandboxParsed.claudeAiOauth) {
+        console.log("[Looper] Sandbox credentials file doesn't contain OAuth data.");
+        return;
+      }
+    } catch (err) {
+      console.warn("[Looper] Failed to parse sandbox credentials:", err);
+      return;
+    }
+
+    let localParsed: { claudeAiOauth?: { accessToken: string; expiresAt: number } } | null = null;
+    try {
+      const localContent = await fs.readFile(localPath, "utf8");
+      localParsed = JSON.parse(localContent);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
+        console.warn("[Looper] Failed to read local credentials:", err);
+        return;
+      }
+    }
+
+    const localToken = localParsed?.claudeAiOauth?.accessToken;
+    const sandboxToken = sandboxParsed.claudeAiOauth.accessToken;
+    const localExpiresAt = localParsed?.claudeAiOauth?.expiresAt;
+    const sandboxExpiresAt = sandboxParsed.claudeAiOauth.expiresAt;
+
+    if (localToken !== sandboxToken || (sandboxExpiresAt && sandboxExpiresAt > (localExpiresAt || 0))) {
+      await fs.mkdir(path.dirname(localPath), { recursive: true });
+      await fs.writeFile(localPath, sandboxCredentials, "utf8");
+      console.log(`[Looper] Synced refreshed OAuth credentials to ${localPath}`);
+      console.log(`[Looper] Token updated: ${localToken !== sandboxToken ? "YES" : "NO"}, Expires at: ${new Date(sandboxExpiresAt).toISOString()}`);
+    } else {
+      console.log("[Looper] OAuth credentials unchanged, no sync needed.");
+    }
+  } catch (err) {
+    console.warn("[Looper] Failed to sync credentials from sandbox:", err);
   }
 }
 
@@ -321,6 +396,21 @@ async function runHarness() {
   const projectSpec = await fs.readFile(specFile, "utf8");
   await fs.rm(stopFilePath, { force: true });
 
+  const oauthCredentialsJson = process.env.CLAUDE_CODE_CREDENTIALS_JSON;
+  if (oauthCredentialsJson) {
+    const configDir = "/home/looper/.config/claude";
+    process.env.CLAUDE_CONFIG_DIR = configDir;
+    const credentialsPath = path.join(configDir, ".credentials.json");
+    await fs.mkdir(configDir, { recursive: true });
+    await fs.writeFile(credentialsPath, oauthCredentialsJson, "utf8");
+    delete process.env.ANTHROPIC_API_KEY;
+    console.log(`[Harness] Using Claude Code OAuth credentials from ${credentialsPath}`);
+  } else if (process.env.ANTHROPIC_API_KEY) {
+    console.log(`[Harness] Using ANTHROPIC_API_KEY for authentication`);
+  } else {
+    console.warn(`[Harness] Warning: No authentication credentials found (neither OAuth nor ANTHROPIC_API_KEY)`);
+  }
+
   console.log(`[Harness] Project: ${projectName}`);
   console.log(`[Harness] Repo: ${repoUrl} (branch ${branch})`);
   console.log(`[Harness] Sessions: ${maxSessions}`);
@@ -396,6 +486,7 @@ async function parseArgs(): Promise<Config> {
       case "--timeout": config.timeoutSecs = parseInt(args[++i], 10); break;
       case "--repo-url": config.repoUrl = args[++i]; break;
       case "--branch": config.branch = args[++i]; break;
+      case "--claude-oauth-file": config.claudeOAuthFile = args[++i]; break;
       case "-h": case "--help": printUsage(); process.exit(0);
       default:
         if (!arg.startsWith("-") && !config.projectName) {
@@ -407,6 +498,26 @@ async function parseArgs(): Promise<Config> {
 
   if (instructionFile && !config.instruction) {
     config.instruction = await fs.readFile(instructionFile, "utf8");
+  }
+
+  if (config.claudeOAuthFile) {
+    try {
+      config.claudeOAuthCredentials = await fs.readFile(config.claudeOAuthFile, "utf8");
+      JSON.parse(config.claudeOAuthCredentials);
+    } catch (err) {
+      console.error(`Error: Failed to read OAuth credentials from ${config.claudeOAuthFile}:`, err);
+      process.exit(1);
+    }
+  } else {
+    const defaultPath = "./.claude-code-credentials.json";
+    try {
+      const content = await fs.readFile(defaultPath, "utf8");
+      config.claudeOAuthCredentials = content;
+      config.claudeOAuthFile = defaultPath;
+      JSON.parse(content);
+    } catch {
+      // File doesn't exist or invalid, fall back to API key
+    }
   }
 
   if (!config.repoUrl && config.projectName) {
@@ -432,11 +543,12 @@ Options:
   --timeout <secs>         Timeout seconds (default: 3600)
   --repo-url <url>         GitHub repo URL
   --branch <branch>        Git branch (default: main)
+  --claude-oauth-file <f>  Path to Claude Code OAuth credentials JSON (default: ./.claude-code-credentials.json)
 
 Environment:
   GITHUB_OWNER             Derive repo URL from owner + project name
   GITHUB_TOKEN             Required for private repos
-  ANTHROPIC_API_KEY        Required
+  ANTHROPIC_API_KEY        Required if OAuth credentials not provided
 
 Example:
   npx tsx run.ts cowsay --instruction "Build a CLI that prints ASCII cow"
