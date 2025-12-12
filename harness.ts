@@ -23,7 +23,7 @@ export interface LongRunningHarnessConfig {
 
   /**
    * Natural-language project spec, e.g. "Build a clone of claude.ai".
-   * This is passed to the initializer agent.
+   * This is passed to the planning agent.
    */
   projectSpec: string;
 
@@ -39,14 +39,14 @@ export interface LongRunningHarnessConfig {
   model?: string;
 
   /**
-   * Max turns for the initializer session.
+   * Max turns for the planning session.
    */
-  maxInitializerTurns?: number;
+  maxPlanningTurns?: number;
 
   /**
-   * Max turns for each coding session.
+   * Max turns for each working session.
    */
-  maxCodingTurns?: number;
+  maxWorkingTurns?: number;
 
   /**
    * If true, load project-level settings/CLAUDE.md via `settingSources: ['project']`.
@@ -85,16 +85,16 @@ export interface LongRunningHarnessConfig {
   gitToken?: string;
 }
 
-export type HarnessPhase = "initializer" | "coding";
+export type HarnessPhase = "planning" | "working";
 
 interface ProjectPaths {
-  featureList: string;
+  taskList: string;
   progressLog: string;
   initScript: string;
   gitDir: string;
 }
 
-interface FeatureSpec {
+interface TaskSpec {
   id: string;
   category: string;
   description: string;
@@ -102,27 +102,27 @@ interface FeatureSpec {
   passes?: boolean;
 }
 
-type FeatureList = FeatureSpec[];
+type TaskList = TaskSpec[];
 
 /**
  * LongRunningHarness implements a two-agent harness on top of the Claude Agent SDK:
  *
- *  - Planning agent (init phase): first session only. Analyzes the project spec and creates:
- *      * feature_list.json — COMPREHENSIVE list of ALL features from the spec with `passes` flags
+ *  - Planning agent: first session only. Analyzes the project spec and creates:
+ *      * task_list.json — COMPREHENSIVE list of ALL tasks from the spec with `passes` flags
  *      * claude-progress.txt — log of requirements analysis + onboarding notes
- *      * init.sh — placeholder script (coding agent will flesh this out)
+ *      * init.sh — placeholder script (working agent will flesh this out)
  *      * CLAUDE.md — project context for future agents
  *      * initial git repo + commit
- *      NOTE: Planning agent does NOT scaffold the project. "project-setup" is the FIRST feature.
+ *      NOTE: Planning agent does NOT scaffold the project. "project-setup" is the FIRST task.
  *
- *  - Coding agent: each subsequent session:
- *      * Gets oriented (pwd, git log, progress log, feature list, init.sh)
- *      * Chooses a single failing feature (starting with "project-setup" to scaffold)
+ *  - Working agent: each subsequent session:
+ *      * Gets oriented (pwd, git log, progress log, task list, init.sh)
+ *      * Chooses a single failing task (starting with "project-setup" to scaffold)
  *      * Implements it end-to-end
  *      * Verifies it via tests / smoke checks
- *      * Marks the feature as passing and commits + logs progress
+ *      * Marks the task as passing and commits + logs progress
  *
- * Each call to runCodingSession() is an independent context window; the state
+ * Each call to runWorkingSession() is an independent context window; the state
  * lives entirely in the repo (files + git history), following the pattern
  * described in Anthropic's long-running agents blog.
  */
@@ -150,7 +150,7 @@ export class LongRunningHarness {
       path.join(this.workingDir, ".looper-stop-after-session");
 
     this.paths = {
-      featureList: path.join(this.workingDir, "feature_list.json"),
+      taskList: path.join(this.workingDir, "task_list.json"),
       progressLog: path.join(this.workingDir, "claude-progress.txt"),
       initScript: path.join(this.workingDir, "init.sh"),
       gitDir: path.join(this.workingDir, ".git"),
@@ -159,101 +159,101 @@ export class LongRunningHarness {
 
   /**
    * Ensure the project has been initialized. If key artifacts are missing,
-   * run the initializer agent to bootstrap or repair them.
+   * run the planning agent to bootstrap or repair them.
    */
   async ensureInitialized(): Promise<void> {
     await this.syncRepoFromRemote();
 
-    const [hasFeatureList, hasProgressLog, hasGit, hasInit] = await Promise.all([
-      pathExists(this.paths.featureList),
+    const [hasTaskList, hasProgressLog, hasGit, hasInit] = await Promise.all([
+      pathExists(this.paths.taskList),
       pathExists(this.paths.progressLog),
       pathExists(this.paths.gitDir),
       pathExists(this.paths.initScript),
     ]);
 
-    const hasAllArtifacts = hasFeatureList && hasProgressLog && hasGit && hasInit;
+    const hasAllArtifacts = hasTaskList && hasProgressLog && hasGit && hasInit;
 
     if (hasAllArtifacts) {
-      const featureListValid = await this.isFeatureListValid();
+      const taskListValid = await this.isTaskListValid();
 
-      if (featureListValid) {
+      if (taskListValid) {
         console.log("[Harness] Project already initialized.");
         return;
       }
     }
 
-    console.log("[Harness] Project not fully initialized; running initializer agent…");
-    await this.runInitializerAgent();
+    console.log("[Harness] Project not fully initialized; running planning agent…");
+    await this.runPlanningAgent();
   }
 
   /**
-   * Run a single coding session:
-   *  - assumes initializer already ran (or will run as needed)
-   *  - asks Claude to pick one failing feature and push it over the line
+   * Run a single working session:
+   *  - assumes planning already ran (or will run as needed)
+   *  - asks Claude to pick one failing task and push it over the line
    */
-  async runCodingSession(): Promise<void> {
+  async runWorkingSession(): Promise<void> {
     console.log("[Harness] ═══════════════════════════════════════════════════════════");
-    console.log("[Harness] Starting coding session");
+    console.log("[Harness] Starting working session");
     console.log("[Harness] ═══════════════════════════════════════════════════════════");
 
     await this.ensureInitialized();
 
-    const remaining = await this.countRemainingFeatures();
+    const remaining = await this.countRemainingTasks();
     if (remaining != null) {
-      console.log(`[Harness] Remaining failing features: ${remaining}`);
+      console.log(`[Harness] Remaining failing tasks: ${remaining}`);
     }
 
-    const nextFeature = await this.getNextFailingFeature();
-    if (nextFeature) {
-      console.log(`[Harness] Next feature to work on: ${nextFeature.id} (${nextFeature.category})`);
-      console.log(`[Harness]   Description: ${nextFeature.description}`);
+    const nextTask = await this.getNextFailingTask();
+    if (nextTask) {
+      console.log(`[Harness] Next task to work on: ${nextTask.id} (${nextTask.category})`);
+      console.log(`[Harness]   Description: ${nextTask.description}`);
     }
-    const isProjectSetup = nextFeature?.id === "project-setup";
+    const isProjectSetup = nextTask?.id === "project-setup";
     if (isProjectSetup) {
       console.log("[Harness] This is project-setup (scaffolding phase)");
     }
 
-    console.log("[Harness] Starting coding agent session…");
+    console.log("[Harness] Starting working agent session…");
     const options: Options = {
-      ...this.buildBaseOptions("coding"),
-      maxTurns: this.cfg.maxCodingTurns,
+      ...this.buildBaseOptions("working"),
+      maxTurns: this.cfg.maxWorkingTurns,
       // Allow the model to run tools autonomously inside your sandbox.
       permissionMode: "bypassPermissions",
       allowDangerouslySkipPermissions: true,
       ...this.cfg.sdkOptionsOverride,
     };
 
-    await this.runQuery(this.buildCodingPrompt(isProjectSetup), options, "coding");
+    await this.runQuery(this.buildWorkingPrompt(isProjectSetup), options, "working");
 
-    console.log("[Harness] Coding session complete, checking for commits to push...");
-    await this.pushIfNeeded("coding");
+    console.log("[Harness] Working session complete, checking for commits to push...");
+    await this.pushIfNeeded("working");
     console.log("[Harness] ═══════════════════════════════════════════════════════════");
   }
 
   /**
-   * Convenience helper to run multiple coding sessions until:
-   *  - feature_list.json has no failing features, or
+   * Convenience helper to run multiple working sessions until:
+   *  - task_list.json has no failing tasks, or
    *  - we reach maxSessions
    */
   async runUntilDone(maxSessions: number): Promise<void> {
     await this.ensureInitialized();
 
-    // Treat maxSessions <= 0 as "run until all features pass or stop file is hit"
+    // Treat maxSessions <= 0 as "run until all tasks pass or stop file is hit"
     const sessionLimit =
       maxSessions && maxSessions > 0 ? maxSessions : Number.MAX_SAFE_INTEGER;
 
     for (let i = 0; i < sessionLimit; i++) {
-      const remaining = await this.countRemainingFeatures();
+      const remaining = await this.countRemainingTasks();
       if (remaining === 0) {
-        console.log("[Harness] All features are marked as passing. Nothing left to do.");
+        console.log("[Harness] All tasks are marked as passing. Nothing left to do.");
         return;
       }
 
       const sessionLimit = maxSessions > 0 ? `of ${maxSessions}` : "(unlimited)";
       console.log(
-        `[Harness] ===== Coding session #${i + 1} ${sessionLimit} | ${remaining ?? "?"} features remaining =====`
+        `[Harness] ===== Working session #${i + 1} ${sessionLimit} | ${remaining ?? "?"} tasks remaining =====`
       );
-      await this.runCodingSession();
+      await this.runWorkingSession();
 
       if (await this.shouldStopAfterSession()) {
         console.log("[Harness] Stop requested; exiting after completing this session.");
@@ -269,21 +269,21 @@ export class LongRunningHarness {
   }
 
   /**
-   * INTERNAL: Run the initializer agent once.
+   * INTERNAL: Run the planning agent once.
    */
-  private async runInitializerAgent(): Promise<void> {
+  private async runPlanningAgent(): Promise<void> {
     const options: Options = {
-      ...this.buildBaseOptions("initializer"),
-      maxTurns: this.cfg.maxInitializerTurns,
-      // We want the initializer to freely create files, run `git init`, etc.,
+      ...this.buildBaseOptions("planning"),
+      maxTurns: this.cfg.maxPlanningTurns,
+      // We want the planning agent to freely create files, run `git init`, etc.,
       // but ideally inside a locked-down workspace.
       permissionMode: "bypassPermissions",
       allowDangerouslySkipPermissions: true,
       ...this.cfg.sdkOptionsOverride,
     };
 
-    await this.runQuery(this.buildInitializerPrompt(), options, "initializer");
-    await this.pushIfNeeded("initializer");
+    await this.runQuery(this.buildPlanningPrompt(), options, "planning");
+    await this.pushIfNeeded("planning");
   }
 
   /**
@@ -624,31 +624,31 @@ CRITICAL WARNING - DO NOT KILL ALL NODE PROCESSES:
 - To free a specific port: lsof -ti:PORT | xargs kill -9
 - To kill a specific process: pkill -f "specific-process-name"`;
 
-    if (phase === "initializer") {
+    if (phase === "planning") {
       return `You are the PLANNING agent for a Looper-managed project.
-Your PRIMARY job is to create a COMPREHENSIVE feature list that covers EVERYTHING
-in the project spec. Do NOT implement any features or scaffold the project.
-Project setup is the FIRST feature in the list for a coding agent to implement.
-Create coordination artifacts (feature_list.json, claude-progress.txt, init.sh,
-CLAUDE.md) for future coding agents. Work on branch ${this.branch}.
+Your PRIMARY job is to create a COMPREHENSIVE task list that covers EVERYTHING
+in the project spec. Do NOT implement any tasks or scaffold the project.
+Project setup is the FIRST task in the list for a working agent to implement.
+Create coordination artifacts (task_list.json, claude-progress.txt, init.sh,
+CLAUDE.md) for future working agents. Work on branch ${this.branch}.
 ${envInfo}`;
     }
 
-    return `You are a CODING agent for a Looper-managed project.
-Your job is to pick up where previous agents left off, implement one feature
+    return `You are a WORKING agent for a Looper-managed project.
+Your job is to pick up where previous agents left off, implement one task
 at a time, and verify it thoroughly. Work on branch ${this.branch}.
 ${envInfo}`;
   }
 
   /**
-   * Prompt for the initializer agent.
+   * Prompt for the planning agent.
    */
-  private buildInitializerPrompt(): string {
+  private buildPlanningPrompt(): string {
     const { projectSpec, projectName } = this.cfg;
     const name = projectName ?? "this project";
 
     return `
-You are the PLANNING agent assigned to a long-running software project.
+You are the PLANNING agent assigned to a long-running project.
 
 Future agents will continue the work in separate sessions. They will NOT see
 this conversation; they only see the repo on disk and git history.
@@ -658,21 +658,21 @@ Project description:
 ${projectSpec.trim()}
 ---
 
-Your PRIMARY job is to create a COMPREHENSIVE feature list that covers
-EVERYTHING in the project spec. Do NOT implement any features yourself.
-Setting up the project is the FIRST task in the feature list.
+Your PRIMARY job is to create a COMPREHENSIVE task list that covers
+EVERYTHING in the project spec. Do NOT implement any tasks yourself.
+Setting up the project is the FIRST task in the task list.
 
 In this session you must:
 
 1) Carefully analyze the project spec
    - Read every line of the spec above.
-   - Identify ALL features, requirements, behaviors, and capabilities.
+   - Identify ALL tasks, requirements, behaviors, and capabilities.
    - Think about edge cases, error handling, and implied requirements.
    - Consider the user journeys and how they interact with the system.
 
-2) Create feature_list.json at the repo root
-   - It MUST be a JSON array of feature objects.
-   - The FIRST feature MUST be project setup/scaffolding:
+2) Create task_list.json at the repo root
+   - It MUST be a JSON array of task objects.
+   - The FIRST task MUST be project setup/scaffolding:
        {
          "id": "project-setup",
          "category": "infrastructure",
@@ -684,74 +684,74 @@ In this session you must:
          ],
          "passes": false
        }
-   - For EVERY other requirement in the spec, create a feature object with:
+   - For EVERY other requirement in the spec, create a task object with:
        - "id": short, stable identifier (kebab-case)
        - "category": e.g. "functional", "ui", "api", "infrastructure", "performance", "security"
        - "description": one-sentence behavior description
        - "steps": ordered list of manual test steps a human can follow to verify it works
        - "passes": false (always false initially)
-   - Be EXHAUSTIVE. Every feature, behavior, and capability in the spec must have
-     a corresponding entry. If the spec mentions it, there should be a feature for it.
+   - Be EXHAUSTIVE. Every task, behavior, and capability in the spec must have
+     a corresponding entry. If the spec mentions it, there should be a task for it.
    - Include both happy paths AND error cases where the spec implies them.
-   - Order features roughly by dependency (setup first, then core features, then polish).
+   - Order tasks roughly by dependency (setup first, then core tasks, then polish).
 
 3) Create claude-progress.txt at the repo root
    - Start a running log for future agents.
    - Include:
        - Summary of the project requirements from your analysis.
-       - Total number of features identified.
+       - Total number of tasks identified.
        - Recommended approach/architecture (high-level suggestions only).
-       - Note that the first coding agent should start with "project-setup".
+       - Note that the first working agent should start with "project-setup".
 
 4) Create a placeholder init.sh script at the repo root
-   - This script will be fleshed out by the coding agent during project-setup.
+   - This script will be fleshed out by the working agent during project-setup.
    - For now, just create a minimal script:
        #!/bin/bash
        set -e
-       echo "Project not yet set up. Run the project-setup feature first."
+       echo "Project not yet set up. Run the project-setup task first."
        exit 1
    - Make it executable (chmod +x init.sh).
 
 5) Create CLAUDE.md at the repo root
-   - This file provides persistent context for future coding agents.
+   - This file provides persistent context for future working agents.
    - Include:
        - Brief project overview based on the spec.
        - Note that the project is not yet implemented.
        - List the key requirements from the spec.
-       - Recommend a stack/approach (the coding agent will make final decisions).
+       - Recommend a stack/approach (the working agent will make final decisions).
    - Keep it concise—this is the first thing agents read.
 
 6) Initialize git
    - If no git repo exists, initialize one and set origin to the remote.
-   - Add all files and commit with message: "Initial planning: feature list and coordination artifacts"
+   - Add all files and commit with message: "Initial planning: task list and coordination artifacts"
    - Do NOT run "git push" — the harness pushes automatically after your session.
 
 CRITICAL RULES:
 - Do NOT scaffold the project or write any application code.
 - Do NOT choose specific dependencies or create package.json/requirements.txt etc.
-- Do NOT implement any features. Your ONLY job is planning and documentation.
-- Focus 90% of your effort on creating a COMPLETE feature list.
+- Do NOT implement any tasks. Your ONLY job is planning and documentation.
+- Focus 90% of your effort on creating a COMPLETE task list.
 - All "passes" flags MUST be false.
-- If you're unsure whether something is a feature, include it. More is better.
-- If existing artifacts are present, integrate them but ensure the feature list
+- If you're unsure whether something is a task, include it. More is better.
+- If existing artifacts are present, integrate them but ensure the task list
   covers the ENTIRE spec, not just what was previously identified.
 `;
   }
 
   /**
-   * Prompt for coding sessions.
+   * Prompt for working sessions.
    * @param isProjectSetup - If true, includes detailed scaffolding instructions
    */
-  private buildCodingPrompt(isProjectSetup: boolean): string {
+  private buildWorkingPrompt(isProjectSetup: boolean): string {
     const projectSetupSection = isProjectSetup
       ? `
-IMPORTANT: You are working on the "project-setup" feature.
+IMPORTANT: You are working on the "project-setup" task.
 
 This means the project has NOT been scaffolded yet. Your job is to:
   - Read CLAUDE.md and claude-progress.txt for recommended stack/approach.
   - Choose and implement a sensible tech stack for the project requirements.
   - Create the project structure (package.json, dependencies, config files, etc.).
-  - Set up a basic working skeleton that future features can build upon.
+  - Set up a basic working skeleton that future tasks can build upon.
   - Update init.sh to properly install dependencies and run a smoke test.
   - Ensure ./init.sh passes before marking project-setup as complete.
   - Prefer boring, well-known frameworks. Avoid exotic dependencies.
@@ -766,12 +766,12 @@ This means the project has NOT been scaffolded yet. Your job is to:
    - If it fails, dedicate this session to fixing the environment first.
      * Repair dependencies, scripts, or configuration until init.sh succeeds.
      * Document what you fixed in claude-progress.txt.
-     * Do NOT mark any features as passing while the environment is broken.
+     * Do NOT mark any tasks as passing while the environment is broken.
    - Do NOT wait for init.sh to complete before proceeding - just verify it starts successfully.
 `;
 
     return `
-You are a coding agent working on a long-running software project.
+You are a working agent on a long-running project.
 
 Multiple agents will work on this repo across many sessions. You do not have
 access to their conversations; you only see the repo, scripts, tests, and
@@ -779,7 +779,7 @@ git history.
 ${projectSetupSection}
 Key artifacts you should rely on (ALL at repo root, not in subdirectories):
 - CLAUDE.md — project context and guidelines (read this first).
-- feature_list.json — list of end-to-end features with a "passes" flag.
+- task_list.json — list of end-to-end tasks with a "passes" flag.
 - claude-progress.txt — log of previous work and instructions (ALWAYS at repo root).
 - init.sh — script to start the environment and run smoke tests.
 - git log — history of previous changes.
@@ -788,7 +788,7 @@ IMPORTANT: Always write to files at the REPO ROOT, not in subdirectories like ba
 
 Your job in this session is to:
   1. Get oriented.
-  2. Choose a single failing feature.
+  2. Choose a single failing task.
   3. Implement it end-to-end.
   4. Verify it thoroughly.
   5. Leave the environment in a clean, working state.
@@ -800,16 +800,16 @@ Follow this checklist strictly:
    - Ensure the repo is on branch ${this.branch} and synced to origin/${this.branch}.
    - Read claude-progress.txt.
    - Inspect recent git history (e.g. "git log --oneline -20").
-   - Open feature_list.json.
+   - Open task_list.json.
 
-2) Choose a feature
-   - Find the highest-priority feature whose "passes" flag is false.
-   - Features are ordered by dependency—work from top to bottom.
-   - Work on ONE feature only in this session.
+2) Choose a task
+   - Find the highest-priority task whose "passes" flag is false.
+   - Tasks are ordered by dependency—work from top to bottom.
+   - Work on ONE task only in this session.
 ${verifyEnvironmentSection}
-${isProjectSetup ? "3" : "4"}) Implement the chosen feature
+${isProjectSetup ? "3" : "4"}) Implement the chosen task
    - Plan the change at a high level before editing.
-   - Make the smallest coherent set of edits that implement the feature
+   - Make the smallest coherent set of edits that implement the task
      end-to-end (frontend, backend, DB, etc. as needed).
    - Keep the code clean, incremental, and well-documented.
 
@@ -824,20 +824,20 @@ ${isProjectSetup ? "4" : "5"}) Clean up AI-generated patterns ("deslop")
    - The goal is code that looks like a skilled human wrote it, not an AI.
 
 ${isProjectSetup ? "5" : "6"}) Test like a real user
-   - Exercise the full user flow described by that feature's "steps".
+   - Exercise the full user flow described by that task's "steps".
    - Use browser automation or HTTP calls if the tools are available, and
      complement them with unit or integration tests where helpful.
    - Fix any bugs you find and re-run tests as needed.
 
-${isProjectSetup ? "6" : "7"}) Update coordination artifacts ONLY when the feature truly works
-   - In feature_list.json:
-       - Set "passes": true for the completed feature.
+${isProjectSetup ? "6" : "7"}) Update coordination artifacts ONLY when the task truly works
+   - In task_list.json:
+       - Set "passes": true for the completed task.
        - Do NOT edit "category", "description", or "steps" unless you are fixing an objectively incorrect test (e.g., the product requirements changed).
-       - It is unacceptable to delete or weaken tests just to make a feature appear passing.
-       - Do not remove or rename other features.
+       - It is unacceptable to delete or weaken tests just to make a task appear passing.
+       - Do not remove or rename other tasks.
    - In claude-progress.txt:
        - Append an entry summarizing:
-           - Which feature you worked on (by id).
+           - Which task you worked on (by id).
            - Files and modules you changed.
            - How you tested the behavior.
            - Any limitations, TODOs, or follow-up work for future agents.
@@ -845,76 +845,76 @@ ${isProjectSetup ? "6" : "7"}) Update coordination artifacts ONLY when the featu
 ${isProjectSetup ? "7" : "8"}) Commit your work
    - Ensure tests and ./init.sh succeed.
    - Ensure there are no stray debug artifacts or half-done migrations.
-   - Create a focused git commit with a descriptive message tied to the feature.
+   - Create a focused git commit with a descriptive message tied to the task.
    - Do NOT run "git push" — the harness pushes automatically after your session.
    - Leave the working tree clean.
 
 Important constraints:
-- Never mark a feature as passing without real end-to-end verification.
+- Never mark a task as passing without real end-to-end verification.
 - If the environment is badly broken, favor restoring a healthy baseline over
-  adding new features.
+  adding new tasks.
 - If you finish early, invest remaining time in improving tests, docs,
   or small refactors that make future sessions more effective, but do not
-  rush to take on a second major feature.
+  rush to take on a second major task.
 
 Throughout your response:
 - Explain what you are doing and why.
 - When you change files, mention them explicitly.
 - When you test behavior, describe the exact commands or steps you ran.
 
-Begin by summarizing what you see in the repo and which feature you plan to tackle.
+Begin by summarizing what you see in the repo and which task you plan to tackle.
 `;
   }
 
-  private async isFeatureListValid(): Promise<boolean> {
+  private async isTaskListValid(): Promise<boolean> {
     try {
-      await this.readFeatureList();
+      await this.readTaskList();
       return true;
     } catch (err) {
-      console.warn("[Harness] Invalid feature_list.json detected.", err);
+      console.warn("[Harness] Invalid task_list.json detected.", err);
       return false;
     }
   }
 
-  private async readFeatureList(): Promise<FeatureList> {
-    const raw = await fs.readFile(this.paths.featureList, "utf8");
+  private async readTaskList(): Promise<TaskList> {
+    const raw = await fs.readFile(this.paths.taskList, "utf8");
     const data = JSON.parse(raw);
 
     if (!Array.isArray(data)) {
-      throw new Error("feature_list.json is not an array");
+      throw new Error("task_list.json is not an array");
     }
 
     return data.map((item, idx) => {
       if (!item || typeof item !== "object") {
-        throw new Error(`feature_list.json entry ${idx} is not an object`);
+        throw new Error(`task_list.json entry ${idx} is not an object`);
       }
 
       const record = item as Record<string, unknown>;
 
       // Validate required string fields
       if (typeof record.id !== "string" || record.id.trim() === "") {
-        throw new Error(`feature_list.json entry ${idx} is missing a valid "id" string`);
+        throw new Error(`task_list.json entry ${idx} is missing a valid "id" string`);
       }
       if (typeof record.category !== "string" || record.category.trim() === "") {
-        throw new Error(`feature_list.json entry ${idx} is missing a valid "category" string`);
+        throw new Error(`task_list.json entry ${idx} is missing a valid "category" string`);
       }
       if (typeof record.description !== "string" || record.description.trim() === "") {
-        throw new Error(`feature_list.json entry ${idx} is missing a valid "description" string`);
+        throw new Error(`task_list.json entry ${idx} is missing a valid "description" string`);
       }
 
       // Validate steps array
       if (!Array.isArray(record.steps)) {
-        throw new Error(`feature_list.json entry ${idx} is missing a valid "steps" array`);
+        throw new Error(`task_list.json entry ${idx} is missing a valid "steps" array`);
       }
       for (let i = 0; i < record.steps.length; i++) {
         if (typeof record.steps[i] !== "string") {
-          throw new Error(`feature_list.json entry ${idx} has non-string step at index ${i}`);
+          throw new Error(`task_list.json entry ${idx} has non-string step at index ${i}`);
         }
       }
 
       // Validate optional passes flag
       if (record.passes !== undefined && typeof record.passes !== "boolean") {
-        throw new Error(`feature_list.json entry ${idx} has an invalid "passes" flag (must be boolean)`);
+        throw new Error(`task_list.json entry ${idx} has an invalid "passes" flag (must be boolean)`);
       }
 
       return {
@@ -928,18 +928,18 @@ Begin by summarizing what you see in the repo and which feature you plan to tack
   }
 
   /**
-   * Count remaining failing features in feature_list.json, if present.
+   * Count remaining failing tasks in task_list.json, if present.
    * Returns:
    *  - number (>=0) if the file is parseable
    *  - null if the file is missing or malformed
    */
-  private async countRemainingFeatures(): Promise<number | null> {
-    if (!(await pathExists(this.paths.featureList))) {
+  private async countRemainingTasks(): Promise<number | null> {
+    if (!(await pathExists(this.paths.taskList))) {
       return null;
     }
 
     try {
-      const data = await this.readFeatureList();
+      const data = await this.readTaskList();
       let remaining = 0;
       for (const item of data) {
         if (item.passes === false || item.passes === undefined) {
@@ -949,7 +949,7 @@ Begin by summarizing what you see in the repo and which feature you plan to tack
       return remaining;
     } catch (err) {
       console.warn(
-        "[Harness] Invalid feature_list.json; treating remaining features as unknown.",
+        "[Harness] Invalid task_list.json; treating remaining tasks as unknown.",
         err
       );
       return null;
@@ -957,16 +957,16 @@ Begin by summarizing what you see in the repo and which feature you plan to tack
   }
 
   /**
-   * Get the first failing feature from feature_list.json.
-   * Returns null if file is missing/malformed or no failing features exist.
+   * Get the first failing task from task_list.json.
+   * Returns null if file is missing/malformed or no failing tasks exist.
    */
-  private async getNextFailingFeature(): Promise<FeatureSpec | null> {
-    if (!(await pathExists(this.paths.featureList))) {
+  private async getNextFailingTask(): Promise<TaskSpec | null> {
+    if (!(await pathExists(this.paths.taskList))) {
       return null;
     }
 
     try {
-      const data = await this.readFeatureList();
+      const data = await this.readTaskList();
       for (const item of data) {
         if (item.passes === false || item.passes === undefined) {
           return item;

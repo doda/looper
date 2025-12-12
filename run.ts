@@ -1,6 +1,6 @@
 #!/usr/bin/env tsx
 /**
- * Looper - Long-running autonomous coding harness
+ * Looper - Long-running autonomous harness
  *
  * Usage:
  *   npx tsx run.ts <project-name> --instruction "Build X"
@@ -9,7 +9,7 @@
  * Options:
  *   --instruction <text>   Project instruction/spec
  *   --instruction-file <f> Path to file containing instruction
- *   --sessions <n>         Number of coding sessions (default: 10)
+ *   --sessions <n>         Number of working sessions (default: 10)
  *   --cpu <cores>          CPU cores (default: 4.0)
  *   --memory <mb>          Memory in MB (default: 16384)
  *   --timeout <secs>       Timeout in seconds (default: 3600)
@@ -196,7 +196,7 @@ async function runInModal() {
   if (config.claudeOAuthCredentials) {
     secretEntries.CLAUDE_CODE_CREDENTIALS_JSON = config.claudeOAuthCredentials;
   }
-  // Forward Modal credentials so the coding agent can spawn sandboxes
+  // Forward Modal credentials so the working agent can spawn sandboxes
   if (process.env.MODAL_TOKEN_ID) {
     secretEntries.MODAL_TOKEN_ID = process.env.MODAL_TOKEN_ID;
   }
@@ -586,7 +586,7 @@ async function parseArgs(): Promise<Config> {
   const config: Config = {
     projectName: "",
     instruction: "",
-    sessions: 0, // 0 = unlimited sessions until features complete or stop file
+    sessions: 0, // 0 = unlimited sessions until tasks complete or stop file
     cpu: 4.0,
     memoryMb: 16384, // 16GB
     timeoutSecs: 0, // 0 = no timeout
@@ -663,7 +663,7 @@ Usage: npx tsx run.ts <project-name> [options]
 Options:
   --instruction <text>     Project spec as string
   --instruction-file <f>   Path to spec file
-  --sessions <n>           Coding sessions (default: unlimited if 0)
+  --sessions <n>           Working sessions (default: unlimited if 0)
   --cpu <cores>            CPU cores (default: 4.0)
   --memory <mb>            Memory MB (default: 16384)
   --timeout <secs>         Timeout seconds (default: none if 0)

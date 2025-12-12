@@ -1,8 +1,8 @@
 # Looper
 
-A long-running autonomous coding harness built on the [Claude Agent SDK](https://docs.anthropic.com/en/docs/agents-and-tools/claude-agent-sdk).
+A long-running autonomous harness built on the [Claude Agent SDK](https://docs.anthropic.com/en/docs/agents-and-tools/claude-agent-sdk).
 
-Looper manages software projects across multiple independent coding sessions. Each session picks up where the last left off, guided by coordination artifacts stored in git.
+Looper manages projects across multiple independent working sessions. Each session picks up where the last left off, guided by coordination artifacts stored in git.
 
 ## Quick Start
 
@@ -27,8 +27,8 @@ export ANTHROPIC_API_KEY=sk-xxx      # Option 1: API key
 
 Looper uses a two-agent architecture:
 
-1. **Initializer Agent** — Runs once to scaffold the project and create coordination artifacts
-2. **Coding Agent** — Runs in subsequent sessions to implement features one at a time
+1. **Planning Agent** — Runs once to create the task list and coordination artifacts
+2. **Working Agent** — Runs in subsequent sessions to implement tasks one at a time
 
 ### Coordination Artifacts
 
@@ -37,7 +37,7 @@ Each Looper-managed project contains these files:
 | File | Purpose |
 |------|---------|
 | `CLAUDE.md` | Project context and guidelines for agents |
-| `feature_list.json` | Structured list of features with `passes` flags |
+| `task_list.json` | Structured list of tasks with `passes` flags |
 | `claude-progress.txt` | Running log of work and decisions |
 | `init.sh` | Idempotent script to boot environment and run smoke tests |
 
@@ -83,14 +83,14 @@ settingSources: ["project"]
 
 ### 3. System Prompt Append (Phase-Specific)
 
-Short, phase-specific instructions distinguish initializer from coding sessions:
+Short, phase-specific instructions distinguish planning from working sessions:
 
 ```typescript
-// Initializer
-"You are the INITIALIZER agent. Create coordination artifacts..."
+// Planning
+"You are the PLANNING agent. Create coordination artifacts..."
 
-// Coding  
-"You are a CODING agent. Implement one feature at a time..."
+// Working
+"You are a WORKING agent. Implement one task at a time..."
 ```
 
 ### Why This Layered Approach?
@@ -119,8 +119,8 @@ interface LongRunningHarnessConfig {
   gitToken?: string;             // GitHub token (default: GITHUB_TOKEN env)
   
   // Session limits
-  maxInitializerTurns?: number;  // Max turns for initializer (default: 60)
-  maxCodingTurns?: number;       // Max turns per coding session
+  maxPlanningTurns?: number;     // Max turns for planning (default: 60)
+  maxWorkingTurns?: number;      // Max turns per working session
   
   // SDK integration
   useProjectSettings?: boolean;  // Load CLAUDE.md (default: true)
@@ -137,7 +137,7 @@ npx tsx run.ts <project-name> [options]
 Options:
   --instruction <text>     Project spec as string
   --instruction-file <f>   Path to spec file
-  --sessions <n>           Coding sessions (default: 10)
+  --sessions <n>           Working sessions (default: 10)
   --cpu <cores>            CPU cores (default: 1.0)
   --memory <mb>            Memory MB (default: 2048)
   --timeout <secs>         Timeout seconds (default: 3600)

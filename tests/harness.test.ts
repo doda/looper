@@ -97,7 +97,7 @@ describe("LongRunningHarness", () => {
     await fs.rm(remoteRepo.remote, { recursive: true, force: true });
   });
 
-  it("runs the initializer when artifacts are missing", async () => {
+  it("runs the planning agent when artifacts are missing", async () => {
     vi.mocked(mockedQuery).mockImplementation(() => makeSuccessQuery());
     const harness = new LongRunningHarness({
       workingDir: tmpDir,
@@ -113,12 +113,12 @@ describe("LongRunningHarness", () => {
     expect(call.prompt).toContain("You are the PLANNING agent");
   });
 
-  it("skips the initializer when all artifacts are present and valid", async () => {
-    const featureList = [
+  it("skips the planning agent when all artifacts are present and valid", async () => {
+    const taskList = [
       { id: "f1", category: "functional", description: "a", steps: ["step"], passes: false },
     ];
     const { remote, branch } = await createRemoteWithFiles({
-      "feature_list.json": JSON.stringify(featureList, null, 2),
+      "task_list.json": JSON.stringify(taskList, null, 2),
       "claude-progress.txt": "log",
       "init.sh": "#!/usr/bin/env bash\necho ok\n",
     });
@@ -138,7 +138,7 @@ describe("LongRunningHarness", () => {
 
   it("clones from a remote repository when provided", async () => {
     const { remote, branch } = await createRemoteWithFiles({
-      "feature_list.json": JSON.stringify(
+      "task_list.json": JSON.stringify(
         [{ id: "f1", category: "functional", description: "a", steps: ["step"], passes: false }],
         null,
         2
@@ -162,9 +162,9 @@ describe("LongRunningHarness", () => {
     expect(mockedQuery).not.toHaveBeenCalled();
   });
 
-  it("re-runs the initializer when feature_list.json is invalid", async () => {
+  it("re-runs the planning agent when task_list.json is invalid", async () => {
     const { remote, branch } = await createRemoteWithFiles({
-      "feature_list.json": "not json",
+      "task_list.json": "not json",
       "claude-progress.txt": "log",
       "init.sh": "#!/usr/bin/env bash\necho ok\n",
     });
@@ -182,17 +182,17 @@ describe("LongRunningHarness", () => {
     expect(mockedQuery).toHaveBeenCalledTimes(1);
   });
 
-  it("counts remaining features correctly", async () => {
-    const featureList = [
+  it("counts remaining tasks correctly", async () => {
+    const taskList = [
       { id: "f1", category: "functional", description: "a", steps: ["step"], passes: false },
       { id: "f2", category: "functional", description: "b", steps: ["step"], passes: true },
       { id: "f3", category: "functional", description: "c", steps: ["step"] },
     ];
     const { remote, branch } = await createRemoteWithFiles({
-      "feature_list.json": JSON.stringify(featureList, null, 2),
+      "task_list.json": JSON.stringify(taskList, null, 2),
     });
 
-    // Pre-clone so countRemainingFeatures can read the file without running the initializer.
+    // Pre-clone so countRemainingTasks can read the file without running the planning agent.
     await runGit(["clone", "--branch", branch, "--single-branch", remote, tmpDir]);
 
     const harness = new LongRunningHarness({
@@ -202,7 +202,7 @@ describe("LongRunningHarness", () => {
       branch,
     });
 
-    const remaining = await (harness as any).countRemainingFeatures();
+    const remaining = await (harness as any).countRemainingTasks();
 
     expect(remaining).toBe(2);
   });

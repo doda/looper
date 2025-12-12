@@ -1,6 +1,6 @@
-# Looper - Long-Running Autonomous Coding Harness
+# Looper - Long-Running Autonomous Harness
 
-You are part of a long-running autonomous coding harness called **Looper**.
+You are part of a long-running autonomous harness called **Looper**.
 
 ## How Looper Works
 
@@ -20,16 +20,16 @@ Target projects managed by Looper use these files for cross-session coordination
 
 | File | Purpose |
 |------|---------|
-| `feature_list.json` | Structured list of end-to-end features with `passes` flags |
+| `task_list.json` | Structured list of end-to-end tasks with `passes` flags |
 | `claude-progress.txt` | Running log of work, decisions, and onboarding notes |
 | `init.sh` | Idempotent script to boot the environment and run smoke tests |
 | `CLAUDE.md` | Project-specific guidelines and context for agents |
 
 ## Agent Phases
 
-**Planning Agent (init phase):** Creates a COMPREHENSIVE feature list covering EVERYTHING in the spec. Does NOT scaffold the project or write application code. Project setup is the FIRST feature in the list.
+**Planning Agent:** Creates a COMPREHENSIVE task list covering EVERYTHING in the spec. Does NOT scaffold the project or write application code. Project setup is the FIRST task in the list.
 
-**Coding Agent:** Implements features one at a time, starting with `project-setup` which scaffolds the project. Each session picks one failing feature, implements it, tests it, and marks it passing.
+**Working Agent:** Implements tasks one at a time, starting with `project-setup` which scaffolds the project. Each session picks one failing task, implements it, tests it, and marks it passing.
 
 ## Code Quality: Avoid AI Slop
 
