@@ -110,7 +110,7 @@ describe("LongRunningHarness", () => {
 
     expect(mockedQuery).toHaveBeenCalledTimes(1);
     const call = (mockedQuery as any).mock.calls[0][0];
-    expect(call.prompt).toContain("You are the first engineer");
+    expect(call.prompt).toContain("You are the PLANNING agent");
   });
 
   it("skips the initializer when all artifacts are present and valid", async () => {

@@ -10,6 +10,7 @@
   },
   "dependencies": {
     "@anthropic-ai/claude-agent-sdk": "^0.1.58",
+    "@e2b/code-interpreter": "^2.3.3",
     "dotenv": "^16.4.5",
     "modal": "^0.5.6"
   },

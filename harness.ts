@@ -107,15 +107,17 @@ type FeatureList = FeatureSpec[];
 /**
  * LongRunningHarness implements a two-agent harness on top of the Claude Agent SDK:
  *
- *  - Initializer agent: first session only. Expands the project spec into:
- *      * feature_list.json — structured end-to-end features with `passes` flags
- *      * claude-progress.txt — log of work + onboarding notes
- *      * init.sh — script to boot the env and run a smoke test
+ *  - Planning agent (init phase): first session only. Analyzes the project spec and creates:
+ *      * feature_list.json — COMPREHENSIVE list of ALL features from the spec with `passes` flags
+ *      * claude-progress.txt — log of requirements analysis + onboarding notes
+ *      * init.sh — placeholder script (coding agent will flesh this out)
+ *      * CLAUDE.md — project context for future agents
  *      * initial git repo + commit
+ *      NOTE: Planning agent does NOT scaffold the project. "project-setup" is the FIRST feature.
  *
  *  - Coding agent: each subsequent session:
  *      * Gets oriented (pwd, git log, progress log, feature list, init.sh)
- *      * Chooses a single failing feature
+ *      * Chooses a single failing feature (starting with "project-setup" to scaffold)
  *      * Implements it end-to-end
  *      * Verifies it via tests / smoke checks
  *      * Marks the feature as passing and commits + logs progress
@@ -190,11 +192,25 @@ export class LongRunningHarness {
    *  - asks Claude to pick one failing feature and push it over the line
    */
   async runCodingSession(): Promise<void> {
+    console.log("[Harness] ═══════════════════════════════════════════════════════════");
+    console.log("[Harness] Starting coding session");
+    console.log("[Harness] ═══════════════════════════════════════════════════════════");
+
     await this.ensureInitialized();
 
     const remaining = await this.countRemainingFeatures();
     if (remaining != null) {
       console.log(`[Harness] Remaining failing features: ${remaining}`);
+    }
+
+    const nextFeature = await this.getNextFailingFeature();
+    if (nextFeature) {
+      console.log(`[Harness] Next feature to work on: ${nextFeature.id} (${nextFeature.category})`);
+      console.log(`[Harness]   Description: ${nextFeature.description}`);
+    }
+    const isProjectSetup = nextFeature?.id === "project-setup";
+    if (isProjectSetup) {
+      console.log("[Harness] This is project-setup (scaffolding phase)");
     }
 
     console.log("[Harness] Starting coding agent session…");
@@ -207,8 +223,11 @@ export class LongRunningHarness {
       ...this.cfg.sdkOptionsOverride,
     };
 
-    await this.runQuery(this.buildCodingPrompt(), options, "coding");
+    await this.runQuery(this.buildCodingPrompt(isProjectSetup), options, "coding");
+
+    console.log("[Harness] Coding session complete, checking for commits to push...");
     await this.pushIfNeeded("coding");
+    console.log("[Harness] ═══════════════════════════════════════════════════════════");
   }
 
   /**
@@ -219,15 +238,20 @@ export class LongRunningHarness {
   async runUntilDone(maxSessions: number): Promise<void> {
     await this.ensureInitialized();
 
-    for (let i = 0; i < maxSessions; i++) {
+    // Treat maxSessions <= 0 as "run until all features pass or stop file is hit"
+    const sessionLimit =
+      maxSessions && maxSessions > 0 ? maxSessions : Number.MAX_SAFE_INTEGER;
+
+    for (let i = 0; i < sessionLimit; i++) {
       const remaining = await this.countRemainingFeatures();
       if (remaining === 0) {
         console.log("[Harness] All features are marked as passing. Nothing left to do.");
         return;
       }
 
+      const sessionLimit = maxSessions > 0 ? `of ${maxSessions}` : "(unlimited)";
       console.log(
-        `[Harness] ===== Coding session ${i + 1}/${maxSessions} (remaining=${remaining ?? "unknown"}) =====`
+        `[Harness] ===== Coding session #${i + 1} ${sessionLimit} | ${remaining ?? "?"} features remaining =====`
       );
       await this.runCodingSession();
 
@@ -237,7 +261,11 @@ export class LongRunningHarness {
       }
     }
 
-    console.log("[Harness] Reached maxSessions limit.");
+    if (sessionLimit !== Number.MAX_SAFE_INTEGER) {
+      console.log("[Harness] Reached maxSessions limit.");
+    } else {
+      console.log("[Harness] Stopping unlimited run loop.");
+    }
   }
 
   /**
@@ -294,6 +322,7 @@ export class LongRunningHarness {
    * Handles empty repos by initializing them locally first.
    */
   private async syncRepoFromRemote(): Promise<void> {
+    console.log(`[Harness] Syncing from remote: ${this.repositoryUrl} (branch: ${this.branch})`);
     await this.ensureRemoteRepoExists();
     const repoExists = await pathExists(this.paths.gitDir);
     const env = this.buildGitEnv();
@@ -301,6 +330,7 @@ export class LongRunningHarness {
     const authUrl = this.getAuthenticatedRepoUrl();
 
     if (!repoExists) {
+      console.log(`[Harness] No local repo at ${this.workingDir}, cloning...`);
       await fs.mkdir(this.workingDir, { recursive: true });
 
       // Try to clone; if it fails due to empty repo, initialize locally
@@ -311,6 +341,7 @@ export class LongRunningHarness {
         );
         // Set the remote to the non-authenticated URL for display purposes
         await this.execGit(["-C", this.workingDir, "remote", "set-url", "origin", this.repositoryUrl], env);
+        console.log(`[Harness] ✓ Cloned repository successfully`);
         return;
       } catch (err: any) {
         const msg = err?.message ?? "";
@@ -320,12 +351,14 @@ export class LongRunningHarness {
           await execFileAsync("git", ["init"], { cwd: this.workingDir, env });
           await execFileAsync("git", ["remote", "add", "origin", this.repositoryUrl], { cwd: this.workingDir, env });
           await execFileAsync("git", ["checkout", "-b", branchRef], { cwd: this.workingDir, env });
+          console.log(`[Harness] ✓ Initialized empty local repo`);
           return;
         }
         throw err;
       }
     }
 
+    console.log(`[Harness] Local repo exists, fetching and resetting to origin/${branchRef}...`);
     // Update remote URL to authenticated version for fetch
     await this.execGit(["-C", this.workingDir, "remote", "set-url", "origin", authUrl], env);
     try {
@@ -333,6 +366,7 @@ export class LongRunningHarness {
       await this.execGit(["-C", this.workingDir, "checkout", branchRef], env);
       await this.execGit(["-C", this.workingDir, "reset", "--hard", `origin/${branchRef}`], env);
       await this.execGit(["-C", this.workingDir, "clean", "-fd"], env);
+      console.log(`[Harness] ✓ Synced to origin/${branchRef}`);
     } catch (err: any) {
       const msg = err?.message ?? "";
       // Handle case where remote branch doesn't exist yet (empty repo)
@@ -373,9 +407,16 @@ export class LongRunningHarness {
     return this.repositoryUrl;
   }
 
-  private async execGit(args: string[], env: NodeJS.ProcessEnv): Promise<void> {
+  private async execGit(args: string[], env: NodeJS.ProcessEnv): Promise<string> {
+    const redactedArgs = args.map(a => a.replace(/x-access-token:[^@]+@/g, "x-access-token:***@"));
+    console.log(`[Harness] git ${redactedArgs.join(" ")}`);
     try {
-      await execFileAsync("git", args, { env });
+      const result = await execFileAsync("git", args, { env });
+      const stdout = result.stdout?.toString().trim();
+      if (stdout) {
+        console.log(`[Harness] git output: ${stdout.substring(0, 200)}${stdout.length > 200 ? "..." : ""}`);
+      }
+      return stdout ?? "";
     } catch (err: any) {
       const stderr =
         (typeof err?.stderr === "string" && err.stderr) ||
@@ -384,13 +425,14 @@ export class LongRunningHarness {
         "unknown error";
       // Redact any tokens from error messages
       const redactedStderr = stderr.replace(/x-access-token:[^@]+@/g, "x-access-token:***@");
-      const redactedArgs = args.map(a => a.replace(/x-access-token:[^@]+@/g, "x-access-token:***@"));
+      console.error(`[Harness] git error: ${redactedStderr.substring(0, 500)}`);
       throw new Error(`[Harness] Git command failed (${redactedArgs.join(" ")}): ${redactedStderr}`);
     }
   }
 
   /** Push any unpushed commits to origin/<branch>. */
   private async pushIfNeeded(phase: HarnessPhase): Promise<void> {
+    console.log(`[Harness] Checking for unpushed commits (${phase})...`);
     const needsToken = this.requiresGithubToken(this.repositoryUrl);
     if (needsToken && !this.gitToken) {
       throw new Error(
@@ -401,50 +443,60 @@ export class LongRunningHarness {
     const env = this.buildGitEnv();
 
     // Check if there are any commits at all
-    let hasCommits = false;
+    let headSha: string | null = null;
     try {
-      await execFileAsync("git", ["-C", this.workingDir, "rev-parse", "HEAD"], { env });
-      hasCommits = true;
+      const result = await execFileAsync("git", ["-C", this.workingDir, "rev-parse", "HEAD"], { env });
+      headSha = result.stdout.trim();
+      console.log(`[Harness] Current HEAD: ${headSha}`);
     } catch {
       console.log(`[Harness] No commits yet, nothing to push.`);
       return;
     }
 
-    if (!hasCommits) return;
+    if (!headSha) return;
 
     // Check for unpushed commits (comparing local HEAD to origin/<branch>)
-    let hasUnpushed = true;
+    let unpushedCommits: string[] = [];
     try {
       const result = await execFileAsync(
         "git",
         ["-C", this.workingDir, "log", `origin/${this.branch}..HEAD`, "--oneline"],
         { env }
       );
-      hasUnpushed = result.stdout.trim().length > 0;
+      unpushedCommits = result.stdout.trim().split("\n").filter(Boolean);
+      console.log(`[Harness] Unpushed commits: ${unpushedCommits.length}`);
+      for (const commit of unpushedCommits) {
+        console.log(`[Harness]   - ${commit}`);
+      }
     } catch {
       // origin/<branch> doesn't exist yet, so all local commits are unpushed
-      hasUnpushed = true;
+      console.log(`[Harness] Remote branch origin/${this.branch} not found, all commits are unpushed`);
+      unpushedCommits = ["all"];
     }
 
-    if (!hasUnpushed) {
+    if (unpushedCommits.length === 0) {
       console.log(`[Harness] No unpushed commits after ${phase} phase.`);
       return;
     }
 
     // Pull (rebase) then push to origin
     const authUrl = this.getAuthenticatedRepoUrl();
+    console.log(`[Harness] Pushing to origin/${this.branch}...`);
     try {
       // First, try to pull with rebase in case remote has new commits
       try {
+        console.log(`[Harness] Attempting pull --rebase first...`);
         await this.execGit(["-C", this.workingDir, "pull", "--rebase", authUrl, this.branch], env);
-      } catch {
+      } catch (pullErr) {
         // Pull may fail if remote branch doesn't exist yet, that's OK
+        console.log(`[Harness] Pull --rebase skipped or failed (may be expected):`, pullErr instanceof Error ? pullErr.message : pullErr);
       }
       // Use -u to set upstream if this is the first push
+      console.log(`[Harness] Executing push...`);
       await this.execGit(["-C", this.workingDir, "push", "-u", authUrl, this.branch], env);
-      console.log(`[Harness] Pushed commits to origin/${this.branch} (${phase}).`);
+      console.log(`[Harness] ✓ Successfully pushed ${unpushedCommits.length} commit(s) to origin/${this.branch} (${phase}).`);
     } catch (err) {
-      console.error(`[Harness] Failed to push to origin/${this.branch}:`, err);
+      console.error(`[Harness] ✗ Failed to push to origin/${this.branch}:`, err);
       throw new Error(
         `[Harness] Failed to push to origin/${this.branch}. Ensure GITHUB_TOKEN has repo push permissions.`
       );
@@ -560,13 +612,24 @@ export class LongRunningHarness {
 ENVIRONMENT INFO:
 - Docker/docker-compose is NOT available (container networking restrictions)
 - Pre-installed: git, curl, node, go, python3, build-essential
+- Modal SDK (TypeScript): Available via npm package "modal" - you CAN spawn Modal sandboxes
+- Modal credentials are available in environment (MODAL_TOKEN_ID, MODAL_TOKEN_SECRET)
 - For services like databases, download standalone binaries (e.g., etcd, minio)
-- Project-specific dependencies should be installed via init.sh`;
+- Project-specific dependencies should be installed via init.sh
+- Playwright MCP browser automation is available (use --browser chromium --headless)
+
+CRITICAL WARNING - DO NOT KILL ALL NODE PROCESSES:
+- NEVER run: pkill -f "npm|node|vite" or killall node
+- The harness itself runs on Node.js - killing all node processes kills the harness!
+- To free a specific port: lsof -ti:PORT | xargs kill -9
+- To kill a specific process: pkill -f "specific-process-name"`;
 
     if (phase === "initializer") {
-      return `You are the INITIALIZER agent for a Looper-managed project.
-Your job is to choose a reasonable stack, scaffold the project, and create
-the coordination artifacts (feature_list.json, claude-progress.txt, init.sh,
+      return `You are the PLANNING agent for a Looper-managed project.
+Your PRIMARY job is to create a COMPREHENSIVE feature list that covers EVERYTHING
+in the project spec. Do NOT implement any features or scaffold the project.
+Project setup is the FIRST feature in the list for a coding agent to implement.
+Create coordination artifacts (feature_list.json, claude-progress.txt, init.sh,
 CLAUDE.md) for future coding agents. Work on branch ${this.branch}.
 ${envInfo}`;
     }
@@ -585,7 +648,7 @@ ${envInfo}`;
     const name = projectName ?? "this project";
 
     return `
-You are the first engineer assigned to a long-running software project.
+You are the PLANNING agent assigned to a long-running software project.
 
 Future agents will continue the work in separate sessions. They will NOT see
 this conversation; they only see the repo on disk and git history.
@@ -595,91 +658,133 @@ Project description:
 ${projectSpec.trim()}
 ---
 
+Your PRIMARY job is to create a COMPREHENSIVE feature list that covers
+EVERYTHING in the project spec. Do NOT implement any features yourself.
+Setting up the project is the FIRST task in the feature list.
+
 In this session you must:
 
-1) Scaffold the project
-   - Choose a sensible stack and layout for ${name}.
-   - Create the minimal code and configuration needed to run the app locally.
-   - Prefer boring, well-known frameworks and tooling.
-   - Work directly in a git repo cloned from the remote; keep branch ${this.branch}.
+1) Carefully analyze the project spec
+   - Read every line of the spec above.
+   - Identify ALL features, requirements, behaviors, and capabilities.
+   - Think about edge cases, error handling, and implied requirements.
+   - Consider the user journeys and how they interact with the system.
 
 2) Create feature_list.json at the repo root
-   - It should be a JSON array of feature objects.
-   - For each feature, include:
-       - "id": short, stable identifier
-       - "category": e.g. "functional", "usability", "performance"
+   - It MUST be a JSON array of feature objects.
+   - The FIRST feature MUST be project setup/scaffolding:
+       {
+         "id": "project-setup",
+         "category": "infrastructure",
+         "description": "Set up the project with a sensible stack, dependencies, and basic structure",
+         "steps": [
+           "Run init.sh successfully",
+           "Verify the chosen framework/stack is installed",
+           "Confirm the project structure matches best practices for the stack"
+         ],
+         "passes": false
+       }
+   - For EVERY other requirement in the spec, create a feature object with:
+       - "id": short, stable identifier (kebab-case)
+       - "category": e.g. "functional", "ui", "api", "infrastructure", "performance", "security"
        - "description": one-sentence behavior description
-       - "steps": ordered list of manual test steps a human can follow
-       - "passes": boolean, initially false for every feature
-   - Cover all important end-to-end behaviors implied by the project spec,
-     not just trivial ones.
-   - IMPORTANT: Before finalizing feature_list.json, run at least one test
-     command yourself to verify it actually works. Do not assume Node.js
-     can execute TypeScript files directly.
+       - "steps": ordered list of manual test steps a human can follow to verify it works
+       - "passes": false (always false initially)
+   - Be EXHAUSTIVE. Every feature, behavior, and capability in the spec must have
+     a corresponding entry. If the spec mentions it, there should be a feature for it.
+   - Include both happy paths AND error cases where the spec implies them.
+   - Order features roughly by dependency (setup first, then core features, then polish).
 
 3) Create claude-progress.txt at the repo root
    - Start a running log for future agents.
    - Include:
-       - Overview of the architecture and tech stack.
-       - Exact commands to run the dev server and tests.
-       - A bullet list of what you implemented in this session.
-       - Clear suggestions for what the next agent should work on.
+       - Summary of the project requirements from your analysis.
+       - Total number of features identified.
+       - Recommended approach/architecture (high-level suggestions only).
+       - Note that the first coding agent should start with "project-setup".
 
-4) Create an init.sh script at the repo root
-   - This script prepares and validates the environment.
-   - It should:
-       - Install dependencies if needed.
-       - Start any dev servers required for e2e testing.
-       - Run a minimal smoke test of the core flow
-         (for example, a health check or simple end-to-end test).
-   - Make it idempotent and safe to run repeatedly.
-   - Use clear comments and exit with non-zero status on failure.
+4) Create a placeholder init.sh script at the repo root
+   - This script will be fleshed out by the coding agent during project-setup.
+   - For now, just create a minimal script:
+       #!/bin/bash
+       set -e
+       echo "Project not yet set up. Run the project-setup feature first."
+       exit 1
+   - Make it executable (chmod +x init.sh).
 
 5) Create CLAUDE.md at the repo root
    - This file provides persistent context for future coding agents.
    - Include:
-       - Brief project overview and architecture.
-       - Key technical decisions and constraints.
-       - Coding standards specific to this project.
-       - Common commands (build, test, run).
-       - Any gotchas or important notes for future agents.
-   - Keep it concise but informative—this is the first thing agents read.
+       - Brief project overview based on the spec.
+       - Note that the project is not yet implemented.
+       - List the key requirements from the spec.
+       - Recommend a stack/approach (the coding agent will make final decisions).
+   - Keep it concise—this is the first thing agents read.
 
-7) Initialize git
+6) Initialize git
    - If no git repo exists, initialize one and set origin to the remote.
-   - Add all relevant files and commit.
+   - Add all files and commit with message: "Initial planning: feature list and coordination artifacts"
    - Do NOT run "git push" — the harness pushes automatically after your session.
 
-General rules:
-- Do NOT try to fully implement all features in one go. Focus on a solid,
-  well-tested foundation.
-- Leave the repo in a working state at the end: app runs, smoke tests pass.
-- Treat feature_list.json and claude-progress.txt as the source of truth
-  for coordination across sessions.
-- Do not mark any feature as passing in this session; all "passes" flags
-  should remain false for now.
-- If some of these artifacts already exist, update or repair them instead
-  of discarding useful work. Preserve git history where possible.
+CRITICAL RULES:
+- Do NOT scaffold the project or write any application code.
+- Do NOT choose specific dependencies or create package.json/requirements.txt etc.
+- Do NOT implement any features. Your ONLY job is planning and documentation.
+- Focus 90% of your effort on creating a COMPLETE feature list.
+- All "passes" flags MUST be false.
+- If you're unsure whether something is a feature, include it. More is better.
+- If existing artifacts are present, integrate them but ensure the feature list
+  covers the ENTIRE spec, not just what was previously identified.
 `;
   }
 
   /**
    * Prompt for coding sessions.
+   * @param isProjectSetup - If true, includes detailed scaffolding instructions
    */
-  private buildCodingPrompt(): string {
+  private buildCodingPrompt(isProjectSetup: boolean): string {
+    const projectSetupSection = isProjectSetup
+      ? `
+IMPORTANT: You are working on the "project-setup" feature.
+
+This means the project has NOT been scaffolded yet. Your job is to:
+  - Read CLAUDE.md and claude-progress.txt for recommended stack/approach.
+  - Choose and implement a sensible tech stack for the project requirements.
+  - Create the project structure (package.json, dependencies, config files, etc.).
+  - Set up a basic working skeleton that future features can build upon.
+  - Update init.sh to properly install dependencies and run a smoke test.
+  - Ensure ./init.sh passes before marking project-setup as complete.
+  - Prefer boring, well-known frameworks. Avoid exotic dependencies.
+`
+      : "";
+
+    const verifyEnvironmentSection = isProjectSetup
+      ? ""
+      : `
+3) Verify the environment
+   - Run "./init.sh --quick" (fast mode, ~30 seconds).
+   - If it fails, dedicate this session to fixing the environment first.
+     * Repair dependencies, scripts, or configuration until init.sh succeeds.
+     * Document what you fixed in claude-progress.txt.
+     * Do NOT mark any features as passing while the environment is broken.
+   - Do NOT wait for init.sh to complete before proceeding - just verify it starts successfully.
+`;
+
     return `
 You are a coding agent working on a long-running software project.
 
 Multiple agents will work on this repo across many sessions. You do not have
 access to their conversations; you only see the repo, scripts, tests, and
 git history.
-
-Key artifacts you should rely on:
+${projectSetupSection}
+Key artifacts you should rely on (ALL at repo root, not in subdirectories):
 - CLAUDE.md — project context and guidelines (read this first).
 - feature_list.json — list of end-to-end features with a "passes" flag.
-- claude-progress.txt — log of previous work and instructions.
+- claude-progress.txt — log of previous work and instructions (ALWAYS at repo root).
 - init.sh — script to start the environment and run smoke tests.
 - git log — history of previous changes.
+
+IMPORTANT: Always write to files at the REPO ROOT, not in subdirectories like backend/ or frontend/.
 
 Your job in this session is to:
   1. Get oriented.
@@ -699,25 +804,16 @@ Follow this checklist strictly:
 
 2) Choose a feature
    - Find the highest-priority feature whose "passes" flag is false.
-   - If priority is not encoded, choose a reasonable next feature and explain
-     your reasoning in claude-progress.txt.
-   - Work on ONE feature only in this session, unless a tiny supporting change
-     is clearly required.
-
-3) Verify the environment
-   - Run "./init.sh".
-   - If it fails, dedicate this session to fixing the environment.
-     * Repair dependencies, scripts, or configuration until init.sh succeeds.
-     * Document what you fixed in claude-progress.txt.
-     * Do NOT mark any features as passing while the environment is broken.
-
-4) Implement the chosen feature
+   - Features are ordered by dependency—work from top to bottom.
+   - Work on ONE feature only in this session.
+${verifyEnvironmentSection}
+${isProjectSetup ? "3" : "4"}) Implement the chosen feature
    - Plan the change at a high level before editing.
    - Make the smallest coherent set of edits that implement the feature
      end-to-end (frontend, backend, DB, etc. as needed).
    - Keep the code clean, incremental, and well-documented.
 
-5) Clean up AI-generated patterns ("deslop")
+${isProjectSetup ? "4" : "5"}) Clean up AI-generated patterns ("deslop")
    - Review your diff against the previous state (git diff HEAD).
    - Remove patterns that are inconsistent with the existing codebase style:
        - Extra comments that a human wouldn't add or that clash with the file's style.
@@ -727,13 +823,13 @@ Follow this checklist strictly:
        - Any other style inconsistencies with the surrounding code.
    - The goal is code that looks like a skilled human wrote it, not an AI.
 
-6) Test like a real user
+${isProjectSetup ? "5" : "6"}) Test like a real user
    - Exercise the full user flow described by that feature's "steps".
    - Use browser automation or HTTP calls if the tools are available, and
      complement them with unit or integration tests where helpful.
    - Fix any bugs you find and re-run tests as needed.
 
-7) Update coordination artifacts ONLY when the feature truly works
+${isProjectSetup ? "6" : "7"}) Update coordination artifacts ONLY when the feature truly works
    - In feature_list.json:
        - Set "passes": true for the completed feature.
        - Do NOT edit "category", "description", or "steps" unless you are fixing an objectively incorrect test (e.g., the product requirements changed).
@@ -746,7 +842,7 @@ Follow this checklist strictly:
            - How you tested the behavior.
            - Any limitations, TODOs, or follow-up work for future agents.
 
-8) Commit your work
+${isProjectSetup ? "7" : "8"}) Commit your work
    - Ensure tests and ./init.sh succeed.
    - Ensure there are no stray debug artifacts or half-done migrations.
    - Create a focused git commit with a descriptive message tied to the feature.
@@ -861,6 +957,28 @@ Begin by summarizing what you see in the repo and which feature you plan to tack
   }
 
   /**
+   * Get the first failing feature from feature_list.json.
+   * Returns null if file is missing/malformed or no failing features exist.
+   */
+  private async getNextFailingFeature(): Promise<FeatureSpec | null> {
+    if (!(await pathExists(this.paths.featureList))) {
+      return null;
+    }
+
+    try {
+      const data = await this.readFeatureList();
+      for (const item of data) {
+        if (item.passes === false || item.passes === undefined) {
+          return item;
+        }
+      }
+      return null;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
    * Default message logger if no onMessage callback is provided.
    * Keeps this generic but surfaces key info.
    */
@@ -885,7 +1003,9 @@ Begin by summarizing what you see in the repo and which feature you plan to tack
           if (block?.type === "text" && typeof block.text === "string") {
             console.log(`[${phase}] assistant: ${block.text}`);
           } else if (block?.type === "tool_use") {
-            console.log(`[${phase}] tool: ${block.name}`);
+            // Log tool name and a brief summary of input
+            const inputSummary = this.summarizeToolInput(block.name, block.input);
+            console.log(`[${phase}] tool: ${block.name}${inputSummary ? ` (${inputSummary})` : ""}`);
           }
         }
         break;
@@ -914,6 +1034,32 @@ Begin by summarizing what you see in the repo and which feature you plan to tack
       case "stream_event":
         // Partial messages omitted for brevity.
         break;
+    }
+  }
+
+  /**
+   * Summarize tool input for logging purposes.
+   */
+  private summarizeToolInput(toolName: string, input: any): string {
+    if (!input) return "";
+    try {
+      switch (toolName) {
+        case "Bash":
+          return input.command?.substring(0, 60) + (input.command?.length > 60 ? "..." : "");
+        case "Read":
+        case "Write":
+          return input.file_path?.split("/").slice(-2).join("/");
+        case "Edit":
+          return input.file_path?.split("/").slice(-2).join("/");
+        case "Glob":
+          return input.pattern;
+        case "Grep":
+          return input.pattern?.substring(0, 40);
+        default:
+          return "";
+      }
+    } catch {
+      return "";
     }
   }
 

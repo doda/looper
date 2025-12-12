@@ -25,6 +25,12 @@ Target projects managed by Looper use these files for cross-session coordination
 | `init.sh` | Idempotent script to boot the environment and run smoke tests |
 | `CLAUDE.md` | Project-specific guidelines and context for agents |
 
+## Agent Phases
+
+**Planning Agent (init phase):** Creates a COMPREHENSIVE feature list covering EVERYTHING in the spec. Does NOT scaffold the project or write application code. Project setup is the FIRST feature in the list.
+
+**Coding Agent:** Implements features one at a time, starting with `project-setup` which scaffolds the project. Each session picks one failing feature, implements it, tests it, and marks it passing.
+
 ## Code Quality: Avoid AI Slop
 
 After implementing but **before testing**, review your diff and remove patterns inconsistent with the codebase:

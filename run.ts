@@ -10,9 +10,10 @@
  *   --instruction <text>   Project instruction/spec
  *   --instruction-file <f> Path to file containing instruction
  *   --sessions <n>         Number of coding sessions (default: 10)
- *   --cpu <cores>          CPU cores (default: 1.0)
- *   --memory <mb>          Memory in MB (default: 2048)
+ *   --cpu <cores>          CPU cores (default: 4.0)
+ *   --memory <mb>          Memory in MB (default: 16384)
  *   --timeout <secs>       Timeout in seconds (default: 3600)
+ *   --model <model>        Claude model: sonnet, opus (default: sonnet)
  *   --claude-oauth-file <f> Path to Claude Code OAuth credentials JSON (default: ./.claude-code-credentials.json)
  *
  * Environment:
@@ -25,7 +26,11 @@ import "dotenv/config";
 import { ModalClient, type Sandbox } from "modal";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 import { LongRunningHarness } from "./harness.js";
+
+const execFileAsync = promisify(execFile);
 
 interface Config {
   projectName: string;
@@ -36,6 +41,7 @@ interface Config {
   timeoutSecs: number;
   repoUrl: string;
   branch: string;
+  model: string;
   githubToken?: string;
   anthropicApiKey?: string;
   claudeOAuthFile?: string;
@@ -58,6 +64,56 @@ async function main() {
 // Modal orchestration (runs locally)
 // ─────────────────────────────────────────────────────────────────────────────
 
+/** Simple helper to check if a path exists. */
+async function pathExists(p: string): Promise<boolean> {
+  try {
+    await fs.access(p);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Sync OAuth credentials from macOS Keychain if sync-credentials.sh exists.
+ * Returns true if sync was attempted (successfully or not), false if script doesn't exist.
+ */
+async function syncCredentialsIfAvailable(oauthFile: string): Promise<boolean> {
+  const syncScript = path.join(process.cwd(), "sync-credentials.sh");
+  try {
+    await fs.access(syncScript);
+    // Script exists, try to run it
+    try {
+      console.log(`[Looper] Syncing OAuth credentials from Keychain...`);
+      const result = await execFileAsync("bash", [syncScript, oauthFile], {
+        cwd: process.cwd(),
+      });
+      if (result.stdout) {
+        // Filter out just the key messages
+        const lines = result.stdout.toString().split("\n");
+        for (const line of lines) {
+          if (line.includes("Token expires:") || line.includes("Credentials written to:")) {
+            console.log(`[Looper] ${line.replace(/^\[sync-credentials\] /, "")}`);
+          }
+        }
+      }
+      return true;
+    } catch (err: any) {
+      // Script exists but failed - might be missing Keychain entry, that's OK
+      const stderr = err?.stderr?.toString() || "";
+      if (stderr.includes("Could not find credentials")) {
+        console.warn(`[Looper] Could not sync credentials from Keychain (not logged in?), using existing file`);
+      } else {
+        console.warn(`[Looper] Failed to sync credentials:`, err?.message || err);
+      }
+      return true; // We tried
+    }
+  } catch {
+    // Script doesn't exist, that's fine
+    return false;
+  }
+}
+
 async function runInModal() {
   const config = await parseArgs();
 
@@ -69,6 +125,25 @@ async function runInModal() {
   if (!config.repoUrl) {
     console.error("Error: Set GITHUB_OWNER or provide --repo-url\n");
     process.exit(1);
+  }
+
+  // Sync credentials if using OAuth and sync script is available
+  const oauthFile = config.claudeOAuthFile ?? "./.claude-code-credentials.json";
+  if (config.claudeOAuthCredentials || await pathExists(oauthFile)) {
+    await syncCredentialsIfAvailable(oauthFile);
+    // Re-read credentials after sync
+    try {
+      config.claudeOAuthCredentials = await fs.readFile(oauthFile, "utf8");
+      config.claudeOAuthFile = oauthFile;
+      JSON.parse(config.claudeOAuthCredentials);
+    } catch (err) {
+      if (config.claudeOAuthFile) {
+        // Explicit file was provided, fail if we can't read it
+        console.error(`Error: Failed to read OAuth credentials from ${config.claudeOAuthFile}:`, err);
+        process.exit(1);
+      }
+      // Default file doesn't exist or invalid, will fall back to API key
+    }
   }
 
   if (!config.anthropicApiKey && !config.claudeOAuthCredentials) {
@@ -84,7 +159,9 @@ async function runInModal() {
 
   console.log(`[Looper] Project: ${config.projectName}`);
   console.log(`[Looper] Repo: ${config.repoUrl} (branch ${config.branch})`);
-  console.log(`[Looper] Sessions: ${config.sessions}`);
+  console.log(`[Looper] Model: ${config.model}`);
+  console.log(`[Looper] Sessions: ${config.sessions || "unlimited"}`);
+  console.log(`[Looper] Modal credentials: ${process.env.MODAL_TOKEN_ID ? "available" : "not set"}`);
 
   const client = new ModalClient();
   const appName = `looper-${config.projectName}`;
@@ -119,6 +196,13 @@ async function runInModal() {
   if (config.claudeOAuthCredentials) {
     secretEntries.CLAUDE_CODE_CREDENTIALS_JSON = config.claudeOAuthCredentials;
   }
+  // Forward Modal credentials so the coding agent can spawn sandboxes
+  if (process.env.MODAL_TOKEN_ID) {
+    secretEntries.MODAL_TOKEN_ID = process.env.MODAL_TOKEN_ID;
+  }
+  if (process.env.MODAL_TOKEN_SECRET) {
+    secretEntries.MODAL_TOKEN_SECRET = process.env.MODAL_TOKEN_SECRET;
+  }
 
   const secrets = Object.keys(secretEntries).length > 0
     ? [await client.secrets.fromObject(secretEntries)]
@@ -127,10 +211,16 @@ async function runInModal() {
   const projectDir = `/workspace/${config.projectName}`;
 
   console.log("[Looper] Creating sandbox...");
+  // Modal defaults to ~10 minutes if no timeout is provided. Treat 0 as "long timeout".
+  const timeoutMs =
+    config.timeoutSecs > 0
+      ? config.timeoutSecs * 1000
+      : 24 * 60 * 60 * 1000; // 24h fallback
+
   const sandbox = await client.sandboxes.create(app, image, {
     cpu: config.cpu,
     memoryMiB: config.memoryMb,
-    timeoutMs: config.timeoutSecs * 1000,
+    ...(timeoutMs ? { timeoutMs } : {}),
     volumes: { "/workspace": volume },
     env: {
       __LOOPER_IN_MODAL: "1",
@@ -140,7 +230,10 @@ async function runInModal() {
       REPOSITORY_BRANCH: config.branch,
       WORKSPACE_DIR: projectDir,
       MAX_SESSIONS: String(config.sessions),
+      MODEL: config.model,
       LOOPER_STOP_FILE: STOP_FILE_PATH,
+      // Playwright needs to find the browsers installed during image build
+      PLAYWRIGHT_BROWSERS_PATH: "/home/looper/.cache/ms-playwright",
       ...(config.claudeOAuthCredentials ? { CLAUDE_CONFIG_DIR: "/home/looper/.config/claude" } : {}),
     },
     secrets,
@@ -187,11 +280,21 @@ async function runInModal() {
     process.exitCode = result.exitCode;
   } finally {
     process.off("SIGINT", handleSigint);
-    if (config.claudeOAuthCredentials && config.claudeOAuthFile) {
-      await syncCredentialsFromSandbox(sandbox, config.claudeOAuthFile);
+    try {
+      if (config.claudeOAuthCredentials && config.claudeOAuthFile) {
+        await syncCredentialsFromSandbox(sandbox, config.claudeOAuthFile);
+      }
+    } catch (err) {
+      console.warn("[Looper] Failed to sync credentials:", err);
     }
     if (!sandboxTerminated) {
-      await sandbox.terminate();
+      console.log("[Looper] Terminating sandbox...");
+      try {
+        await sandbox.terminate();
+        console.log("[Looper] Sandbox terminated.");
+      } catch (err) {
+        console.warn("[Looper] Failed to terminate sandbox:", err);
+      }
     }
     console.log("[Looper] Done.");
   }
@@ -207,11 +310,15 @@ function buildImage(client: ModalClient) {
       // Go (commonly needed)
       "RUN curl -fsSL https://go.dev/dl/go1.23.4.linux-amd64.tar.gz | tar -C /usr/local -xz",
       "ENV PATH=$PATH:/usr/local/go/bin",
+      // Playwright browser dependencies (for MCP browser automation)
+      "RUN npx -y playwright@latest install-deps chromium",
       // User setup
       "RUN useradd -m -s /bin/bash looper && echo 'looper ALL=(ALL) NOPASSWD:ALL' >> /etc/sudoers",
       "RUN mkdir -p /harness /workspace && chown -R looper:looper /harness /workspace",
       "USER looper",
       "ENV PATH=$PATH:/usr/local/go/bin:/home/looper/go/bin",
+      // Install Playwright browser binaries as looper user
+      "RUN npx -y playwright@latest install chromium",
       "RUN git config --global user.email 'agent@looper.local' && git config --global user.name 'Looper Agent' && git config --global --add safe.directory '*'",
       "WORKDIR /harness",
     ]);
@@ -389,6 +496,7 @@ async function runHarness() {
   const specFile = process.env.PROJECT_SPEC_FILE!;
   const repoUrl = process.env.REPOSITORY_URL!;
   const branch = process.env.REPOSITORY_BRANCH ?? "main";
+  const model = process.env.MODEL ?? "sonnet";
   const workingDir = process.env.WORKSPACE_DIR!;
   const maxSessions = parseInt(process.env.MAX_SESSIONS ?? "10", 10);
   const stopFilePath = process.env.LOOPER_STOP_FILE ?? path.join(workingDir, ".looper-stop-after-session");
@@ -413,18 +521,32 @@ async function runHarness() {
 
   console.log(`[Harness] Project: ${projectName}`);
   console.log(`[Harness] Repo: ${repoUrl} (branch ${branch})`);
+  console.log(`[Harness] Model: ${model}`);
   console.log(`[Harness] Sessions: ${maxSessions}`);
 
   const harness = new LongRunningHarness({
     workingDir,
     projectSpec,
     projectName,
-    model: "sonnet",
+    model,
     repositoryUrl: repoUrl,
     branch,
     gitToken: process.env.GITHUB_TOKEN,
     useProjectSettings: true,
     stopFilePath,
+    // Playwright MCP for browser automation during testing
+    // Use the Chromium binary installed in the image (not Chrome, which requires sudo)
+    mcpServers: {
+      playwright: {
+        command: "npx",
+        args: [
+          "-y",
+          "@playwright/mcp@latest",
+          "--browser", "chromium",
+          "--headless",
+        ],
+      },
+    },
   });
 
   let sigintCount = 0;
@@ -448,6 +570,8 @@ async function runHarness() {
 
   try {
     await harness.runUntilDone(maxSessions);
+    console.log("[Harness] Harness completed successfully, exiting.");
+    process.exit(0);
   } finally {
     process.off("SIGINT", handleSigint);
   }
@@ -462,12 +586,13 @@ async function parseArgs(): Promise<Config> {
   const config: Config = {
     projectName: "",
     instruction: "",
-    sessions: 10,
-    cpu: 1.0,
-    memoryMb: 2048,
-    timeoutSecs: 3600,
+    sessions: 0, // 0 = unlimited sessions until features complete or stop file
+    cpu: 4.0,
+    memoryMb: 16384, // 16GB
+    timeoutSecs: 0, // 0 = no timeout
     repoUrl: "",
     branch: "main",
+    model: "sonnet",
     githubToken: process.env.GITHUB_TOKEN,
     anthropicApiKey: process.env.ANTHROPIC_API_KEY,
   };
@@ -486,6 +611,7 @@ async function parseArgs(): Promise<Config> {
       case "--timeout": config.timeoutSecs = parseInt(args[++i], 10); break;
       case "--repo-url": config.repoUrl = args[++i]; break;
       case "--branch": config.branch = args[++i]; break;
+      case "--model": config.model = args[++i]; break;
       case "--claude-oauth-file": config.claudeOAuthFile = args[++i]; break;
       case "-h": case "--help": printUsage(); process.exit(0);
       default:
@@ -537,12 +663,13 @@ Usage: npx tsx run.ts <project-name> [options]
 Options:
   --instruction <text>     Project spec as string
   --instruction-file <f>   Path to spec file
-  --sessions <n>           Coding sessions (default: 10)
-  --cpu <cores>            CPU cores (default: 1.0)
-  --memory <mb>            Memory MB (default: 2048)
-  --timeout <secs>         Timeout seconds (default: 3600)
+  --sessions <n>           Coding sessions (default: unlimited if 0)
+  --cpu <cores>            CPU cores (default: 4.0)
+  --memory <mb>            Memory MB (default: 16384)
+  --timeout <secs>         Timeout seconds (default: none if 0)
   --repo-url <url>         GitHub repo URL
   --branch <branch>        Git branch (default: main)
+  --model <model>          Claude model: sonnet, opus, etc. (default: sonnet)
   --claude-oauth-file <f>  Path to Claude Code OAuth credentials JSON (default: ./.claude-code-credentials.json)
 
 Environment:
