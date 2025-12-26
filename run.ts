@@ -46,11 +46,18 @@ interface Config {
   anthropicApiKey?: string;
   claudeOAuthFile?: string;
   claudeOAuthCredentials?: string;
+  terminateExisting?: boolean;
+  reviewAgent?: "claude" | "codex";
+  codexModel?: string;
+  codexCredentials?: string;
 }
 
 // Detect if running inside Modal sandbox
 const IN_MODAL = process.env.__LOOPER_IN_MODAL === "1";
 const STOP_FILE_PATH = "/harness/.looper-stop-after-session";
+
+// Self-renewal: spawn successor sandbox before 24h timeout
+const RENEWAL_AFTER_MS = 23 * 60 * 60 * 1000; // 23 hours
 
 async function main() {
   if (IN_MODAL) {
@@ -157,6 +164,21 @@ async function runInModal() {
     console.log(`[Looper] Using ANTHROPIC_API_KEY for authentication`);
   }
 
+  // Load Codex credentials for review (default reviewer)
+  if (config.reviewAgent !== "claude") {
+    const codexAuthPath = path.join(process.env.HOME ?? "", ".codex", "auth.json");
+    try {
+      config.codexCredentials = await fs.readFile(codexAuthPath, "utf8");
+      JSON.parse(config.codexCredentials); // Validate JSON
+      console.log(`[Looper] Using Codex credentials from ${codexAuthPath}`);
+    } catch (err) {
+      console.error(`Error: Codex review (default) requires auth at ${codexAuthPath}`);
+      console.error(`Please run: codex auth login`);
+      console.error(`Or use --review-agent claude to use Claude for review`);
+      process.exit(1);
+    }
+  }
+
   console.log(`[Looper] Project: ${config.projectName}`);
   console.log(`[Looper] Repo: ${config.repoUrl} (branch ${config.branch})`);
   console.log(`[Looper] Model: ${config.model}`);
@@ -171,19 +193,31 @@ async function runInModal() {
   const volume = await client.volumes.fromName(volumeName, { createIfMissing: true });
 
   // Check for existing running sandboxes to prevent concurrent runs
-  const existingSandboxes: string[] = [];
+  const existingSandboxes: Sandbox[] = [];
   for await (const sb of client.sandboxes.list({ appId: app.appId })) {
-    existingSandboxes.push(sb.sandboxId);
+    existingSandboxes.push(sb);
   }
   if (existingSandboxes.length > 0) {
-    console.error(`[Looper] ERROR: Found ${existingSandboxes.length} running sandbox(es) for this project:`);
-    for (const id of existingSandboxes) {
-      console.error(`  - ${id}`);
+    if (config.terminateExisting) {
+      console.log(`[Looper] Found ${existingSandboxes.length} running sandbox(es), terminating...`);
+      for (const sb of existingSandboxes) {
+        console.log(`[Looper] Terminating sandbox: ${sb.sandboxId}`);
+        try {
+          await sb.terminate();
+        } catch (err) {
+          console.warn(`[Looper] Failed to terminate ${sb.sandboxId}:`, err);
+        }
+      }
+      console.log(`[Looper] Existing sandboxes terminated.`);
+    } else {
+      console.error(`[Looper] ERROR: Found ${existingSandboxes.length} running sandbox(es) for this project:`);
+      for (const sb of existingSandboxes) {
+        console.error(`  - ${sb.sandboxId}`);
+      }
+      console.error(`\nConcurrent runs against the same volume will cause conflicts.`);
+      console.error(`Either wait for the existing run to complete, or use --terminate to stop it.\n`);
+      process.exit(1);
     }
-    console.error(`\nConcurrent runs against the same volume will cause conflicts.`);
-    console.error(`Either wait for the existing run to complete, or terminate it with:`);
-    console.error(`  modal sandbox terminate ${existingSandboxes[0]}\n`);
-    process.exit(1);
   }
 
   const image = buildImage(client);
@@ -195,6 +229,9 @@ async function runInModal() {
   }
   if (config.claudeOAuthCredentials) {
     secretEntries.CLAUDE_CODE_CREDENTIALS_JSON = config.claudeOAuthCredentials;
+  }
+  if (config.codexCredentials) {
+    secretEntries.CODEX_CREDENTIALS_JSON = config.codexCredentials;
   }
   // Forward Modal credentials so the working agent can spawn sandboxes
   if (process.env.MODAL_TOKEN_ID) {
@@ -221,6 +258,7 @@ async function runInModal() {
     cpu: config.cpu,
     memoryMiB: config.memoryMb,
     ...(timeoutMs ? { timeoutMs } : {}),
+    idleTimeoutMs: 60 * 1000,
     volumes: { "/workspace": volume },
     env: {
       __LOOPER_IN_MODAL: "1",
@@ -235,6 +273,8 @@ async function runInModal() {
       // Playwright needs to find the browsers installed during image build
       PLAYWRIGHT_BROWSERS_PATH: "/home/looper/.cache/ms-playwright",
       ...(config.claudeOAuthCredentials ? { CLAUDE_CONFIG_DIR: "/home/looper/.config/claude" } : {}),
+      ...(config.reviewAgent ? { REVIEW_AGENT: config.reviewAgent } : {}),
+      ...(config.codexModel ? { CODEX_MODEL: config.codexModel } : {}),
     },
     secrets,
   });
@@ -243,6 +283,25 @@ async function runInModal() {
 
   let sigintCount = 0;
   let sandboxTerminated = false;
+
+  // Ensure sandbox is terminated on process exit (last resort cleanup)
+  const cleanupOnExit = () => {
+    if (!sandboxTerminated) {
+      console.log("[Looper] Process exiting, terminating sandbox...");
+      sandbox.terminate().catch(() => {});
+    }
+  };
+  process.on("exit", cleanupOnExit);
+  process.on("uncaughtException", (err) => {
+    console.error("[Looper] Uncaught exception:", err);
+    cleanupOnExit();
+    process.exit(1);
+  });
+  process.on("unhandledRejection", (reason) => {
+    console.error("[Looper] Unhandled rejection:", reason);
+    cleanupOnExit();
+    process.exit(1);
+  });
 
   const handleSigint = () => {
     sigintCount += 1;
@@ -253,33 +312,75 @@ async function runInModal() {
       return;
     }
 
+    if (sigintCount >= 3) {
+      console.log("\n[Looper] Force exit.");
+      process.exit(1);
+    }
+
     console.log("\n[Looper] Forcing shutdown and terminating sandbox...");
     sandboxTerminated = true;
-    void sandbox.terminate().catch((err: unknown) => {
-      console.warn("[Looper] Failed to terminate sandbox:", err);
-    }).finally(() => {
+    sandbox.terminate().then(() => {
+      process.exit(1);
+    }).catch(() => {
       process.exit(1);
     });
+    // Fallback: force exit after 3 seconds if terminate hangs
+    setTimeout(() => process.exit(1), 3000);
   };
 
   process.on("SIGINT", handleSigint);
 
   try {
     await uploadCode(sandbox, config);
+    console.log("[Looper] Checking repo exists...");
     await ensureRepoExists(config);
+    console.log("[Looper] Repo check complete.");
 
-    const cmd = `sudo mkdir -p ${projectDir} && sudo chown -R looper:looper ${projectDir} && sudo -E -u looper HOME=/home/looper npx tsx run.ts`;
+    // Clean up stale .looper cache, git locks, and set up directories
+    console.log("[Looper] Setting up workspace directories...");
+    const setupCmd = `sudo rm -rf /workspace/.looper && sudo mkdir -p ${projectDir} /workspace/.looper && sudo chown -R looper:looper ${projectDir} /workspace/.looper && sudo rm -f ${projectDir}/.git/index.lock ${projectDir}/.git/*.lock 2>/dev/null || true`;
+    const setupResult = await exec(sandbox, setupCmd, "/harness", { stream: true });
+    if (setupResult.exitCode !== 0) {
+      throw new Error(`Workspace setup failed with exit code ${setupResult.exitCode}`);
+    }
+    console.log("[Looper] Workspace ready. Starting harness...");
+
+    // Add echo to confirm command started, then run tsx
+    const cmd = `echo "[Looper] Harness process starting..." && sudo -E -u looper HOME=/home/looper npx tsx run.ts`;
 
     console.log("─".repeat(60));
-    const result = await exec(sandbox, cmd, "/harness", {
-      stream: true,
-      mirrorToSandboxLogs: true,
-    });
+    let result: { exitCode: number };
+    try {
+      result = await exec(sandbox, cmd, "/harness", {
+        stream: true,
+        mirrorToSandboxLogs: true,
+      });
+    } catch (execErr) {
+      console.error("[Looper] Exec failed:", execErr);
+      result = { exitCode: 1 };
+    }
     console.log("─".repeat(60));
+    console.log(`[Looper] Harness exited with code ${result.exitCode}`);
 
     process.exitCode = result.exitCode;
   } finally {
     process.off("SIGINT", handleSigint);
+    process.off("exit", cleanupOnExit);
+
+    // Always terminate sandbox, even if other cleanup fails
+    const terminateSandbox = async () => {
+      if (!sandboxTerminated) {
+        console.log("[Looper] Terminating sandbox...");
+        try {
+          await sandbox.terminate();
+          sandboxTerminated = true;
+          console.log("[Looper] Sandbox terminated.");
+        } catch (err) {
+          console.warn("[Looper] Failed to terminate sandbox:", err);
+        }
+      }
+    };
+
     try {
       if (config.claudeOAuthCredentials && config.claudeOAuthFile) {
         await syncCredentialsFromSandbox(sandbox, config.claudeOAuthFile);
@@ -287,15 +388,8 @@ async function runInModal() {
     } catch (err) {
       console.warn("[Looper] Failed to sync credentials:", err);
     }
-    if (!sandboxTerminated) {
-      console.log("[Looper] Terminating sandbox...");
-      try {
-        await sandbox.terminate();
-        console.log("[Looper] Sandbox terminated.");
-      } catch (err) {
-        console.warn("[Looper] Failed to terminate sandbox:", err);
-      }
-    }
+
+    await terminateSandbox();
     console.log("[Looper] Done.");
   }
 }
@@ -310,15 +404,23 @@ function buildImage(client: ModalClient) {
       // Go (commonly needed)
       "RUN curl -fsSL https://go.dev/dl/go1.23.4.linux-amd64.tar.gz | tar -C /usr/local -xz",
       "ENV PATH=$PATH:/usr/local/go/bin",
+      // Java (for Kafka client interop testing)
+      "RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y openjdk-17-jdk maven && rm -rf /var/lib/apt/lists/*",
+      "ENV JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64",
+      "ENV PATH=$PATH:$JAVA_HOME/bin",
       // Playwright browser dependencies (for MCP browser automation)
       "RUN npx -y playwright@latest install-deps chromium",
       // User setup
       "RUN useradd -m -s /bin/bash looper && echo 'looper ALL=(ALL) NOPASSWD:ALL' >> /etc/sudoers",
       "RUN mkdir -p /harness /workspace && chown -R looper:looper /harness /workspace",
       "USER looper",
-      "ENV PATH=$PATH:/usr/local/go/bin:/home/looper/go/bin",
+      "ENV PATH=$PATH:/usr/local/go/bin:/home/looper/go/bin:/home/looper/.cargo/bin",
+      // Rust (for krafka and other Rust projects) - installed as looper user
+      "RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable",
       // Install Playwright browser binaries as looper user
       "RUN npx -y playwright@latest install chromium",
+      // Install OpenAI Codex CLI for code review
+      "RUN npm install -g @openai/codex@latest",
       "RUN git config --global user.email 'agent@looper.local' && git config --global user.name 'Looper Agent' && git config --global --add safe.directory '*'",
       "WORKDIR /harness",
     ]);
@@ -329,12 +431,11 @@ async function uploadCode(sandbox: Sandbox, config: Config) {
 
   for (const file of ["harness.ts", "run.ts", "package.json", "tsconfig.json"]) {
     const content = await fs.readFile(path.join(process.cwd(), file), "utf8");
-    const b64 = Buffer.from(content).toString("base64");
-    await exec(sandbox, `echo '${b64}' | base64 -d > '/harness/${file}'`, "/");
+    await writeFileToSandbox(sandbox, `/harness/${file}`, content);
   }
 
-  const specB64 = Buffer.from(config.instruction).toString("base64");
-  await exec(sandbox, `echo '${specB64}' | base64 -d > '/harness/spec.txt'`, "/");
+  // Write spec file (may be large, so use chunked approach)
+  await writeFileToSandbox(sandbox, "/harness/spec.txt", config.instruction);
 
   console.log("[Looper] Installing dependencies...");
   const result = await exec(sandbox, "npm install", "/harness", {
@@ -342,6 +443,33 @@ async function uploadCode(sandbox: Sandbox, config: Config) {
     mirrorToSandboxLogs: true,
   });
   if (result.exitCode !== 0) throw new Error("npm install failed");
+}
+
+/**
+ * Write a file to the sandbox, handling large files by chunking.
+ * Uses heredoc to avoid shell argument length limits.
+ */
+async function writeFileToSandbox(sandbox: Sandbox, filePath: string, content: string) {
+  const b64 = Buffer.from(content).toString("base64");
+  
+  // For small files, use simple echo
+  if (b64.length < 50000) {
+    await exec(sandbox, `echo '${b64}' | base64 -d > '${filePath}'`, "/");
+    return;
+  }
+
+  // For large files, write base64 in chunks then decode
+  const chunkSize = 40000; // Safe chunk size for shell
+  const tempFile = `${filePath}.b64`;
+  
+  for (let i = 0; i < b64.length; i += chunkSize) {
+    const chunk = b64.slice(i, i + chunkSize);
+    const op = i === 0 ? ">" : ">>";
+    // Use heredoc to avoid argument length issues
+    await exec(sandbox, `cat <<'CHUNK_EOF' ${op} '${tempFile}'\n${chunk}\nCHUNK_EOF`, "/");
+  }
+  
+  await exec(sandbox, `base64 -d '${tempFile}' > '${filePath}' && rm '${tempFile}'`, "/");
 }
 
 async function requestGracefulStop(sandbox: Sandbox) {
@@ -470,8 +598,24 @@ async function ensureRepoExists(config: Config) {
     "User-Agent": "looper",
   };
 
-  const check = await fetch(`https://api.github.com/repos/${owner}/${repo}`, { headers });
-  if (check.status === 200) return;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 30000); // 30s timeout
+
+  try {
+    const check = await fetch(`https://api.github.com/repos/${owner}/${repo}`, {
+      headers,
+      signal: controller.signal,
+    });
+    if (check.status === 200) return;
+  } catch (err) {
+    if ((err as Error).name === 'AbortError') {
+      console.warn("[Looper] GitHub API timeout checking repo, continuing anyway...");
+      return;
+    }
+    throw err;
+  } finally {
+    clearTimeout(timeout);
+  }
 
   const body = JSON.stringify({ name: repo, private: true });
   const orgResp = await fetch(`https://api.github.com/orgs/${owner}/repos`, {
@@ -491,6 +635,66 @@ async function ensureRepoExists(config: Config) {
 // Harness execution (runs inside Modal)
 // ─────────────────────────────────────────────────────────────────────────────
 
+/** Spawn a successor sandbox before 24h timeout. */
+async function scheduleRenewal(stopFilePath: string) {
+  // Cache essential harness files to volume for successor (skip node_modules)
+  const cacheDir = "/workspace/.looper";
+  await fs.mkdir(cacheDir, { recursive: true });
+  
+  // Determine source directory - could be /harness (initial) or /workspace/.looper (successor)
+  const sourceDir = path.dirname(new URL(import.meta.url).pathname);
+  
+  // Copy only essential files, not node_modules (will reinstall in successor)
+  const essentialFiles = ["harness.ts", "run.ts", "package.json", "tsconfig.json", "spec.txt"];
+  for (const file of essentialFiles) {
+    try {
+      const srcPath = path.join(sourceDir, file);
+      const destPath = path.join(cacheDir, file);
+      // Skip if source and destination are the same (running from cache already)
+      if (srcPath !== destPath) {
+        await fs.copyFile(srcPath, destPath);
+      }
+    } catch (err) {
+      // spec.txt might not exist yet, that's ok
+      if (file !== "spec.txt") throw err;
+    }
+  }
+  console.log(`[Harness] Renewal scheduled in ${(RENEWAL_AFTER_MS / 3600000).toFixed(1)}h`);
+
+  setTimeout(async () => {
+    console.log("[Harness] Spawning successor sandbox...");
+    try {
+      const client = new ModalClient();
+      const projectName = process.env.PROJECT_NAME!;
+      const app = await client.apps.fromName(`looper-${projectName}`, { createIfMissing: true });
+      const volume = await client.volumes.fromName(`${projectName}-volume`, { createIfMissing: true });
+
+      // Filter env to only defined values
+      const env = Object.fromEntries(
+        Object.entries(process.env).filter((e): e is [string, string] => e[1] !== undefined)
+      );
+      env.PROJECT_SPEC_FILE = "/workspace/.looper/spec.txt";
+
+      // Secrets need explicit handling (can't be in env)
+      const secretKeys = ["GITHUB_TOKEN", "ANTHROPIC_API_KEY", "CLAUDE_CODE_CREDENTIALS_JSON", "CODEX_CREDENTIALS_JSON", "MODAL_TOKEN_ID", "MODAL_TOKEN_SECRET"];
+      const secretEntries = Object.fromEntries(secretKeys.filter(k => env[k]).map(k => [k, env[k]]));
+      const secrets = Object.keys(secretEntries).length ? [await client.secrets.fromObject(secretEntries)] : [];
+
+      const sandbox = await client.sandboxes.create(app, buildImage(client), {
+        cpu: 4.0, memoryMiB: 16384, timeoutMs: 24 * 60 * 60 * 1000,
+        volumes: { "/workspace": volume }, env, secrets,
+      });
+
+      const startCmd = `cd /workspace/.looper && npm install --prefer-offline && sudo -E -u looper HOME=/home/looper npx tsx run.ts`;
+      await sandbox.exec(["bash", "-lc", `nohup bash -c '${startCmd}' > /proc/1/fd/1 2>&1 &`]);
+      console.log(`[Harness] Successor: ${sandbox.sandboxId}`);
+      await fs.writeFile(stopFilePath, "renewal");
+    } catch (err) {
+      console.error("[Harness] Failed to spawn successor:", err);
+    }
+  }, RENEWAL_AFTER_MS);
+}
+
 async function runHarness() {
   const projectName = process.env.PROJECT_NAME!;
   const specFile = process.env.PROJECT_SPEC_FILE!;
@@ -500,9 +704,14 @@ async function runHarness() {
   const workingDir = process.env.WORKSPACE_DIR!;
   const maxSessions = parseInt(process.env.MAX_SESSIONS ?? "10", 10);
   const stopFilePath = process.env.LOOPER_STOP_FILE ?? path.join(workingDir, ".looper-stop-after-session");
+  const reviewAgent = process.env.REVIEW_AGENT as "claude" | "codex" | undefined;
+  const codexModel = process.env.CODEX_MODEL;
 
   const projectSpec = await fs.readFile(specFile, "utf8");
   await fs.rm(stopFilePath, { force: true });
+
+  // Schedule self-renewal before 24h timeout (also caches harness to volume)
+  await scheduleRenewal(stopFilePath);
 
   const oauthCredentialsJson = process.env.CLAUDE_CODE_CREDENTIALS_JSON;
   if (oauthCredentialsJson) {
@@ -519,10 +728,21 @@ async function runHarness() {
     console.warn(`[Harness] Warning: No authentication credentials found (neither OAuth nor ANTHROPIC_API_KEY)`);
   }
 
+  // Write Codex credentials if using codex review agent
+  const codexCredentialsJson = process.env.CODEX_CREDENTIALS_JSON;
+  if (codexCredentialsJson) {
+    const codexDir = "/home/looper/.codex";
+    const codexAuthPath = path.join(codexDir, "auth.json");
+    await fs.mkdir(codexDir, { recursive: true });
+    await fs.writeFile(codexAuthPath, codexCredentialsJson, { mode: 0o600 });
+    console.log(`[Harness] Using Codex credentials from ${codexAuthPath}`);
+  }
+
   console.log(`[Harness] Project: ${projectName}`);
   console.log(`[Harness] Repo: ${repoUrl} (branch ${branch})`);
   console.log(`[Harness] Model: ${model}`);
   console.log(`[Harness] Sessions: ${maxSessions}`);
+  console.log(`[Harness] Review agent: ${reviewAgent ?? "codex"}${codexModel ? ` (model: ${codexModel})` : ""}`);
 
   const harness = new LongRunningHarness({
     workingDir,
@@ -534,6 +754,12 @@ async function runHarness() {
     gitToken: process.env.GITHUB_TOKEN,
     useProjectSettings: true,
     stopFilePath,
+    // Review agent ping-pong flow
+    enableReviewAgent: true,
+    maxReviewIterations: 5,
+    maxReviewTurns: 100,
+    reviewAgent,
+    codexModel,
     // Playwright MCP for browser automation during testing
     // Use the Chromium binary installed in the image (not Chrome, which requires sudo)
     mcpServers: {
@@ -572,6 +798,9 @@ async function runHarness() {
     await harness.runUntilDone(maxSessions);
     console.log("[Harness] Harness completed successfully, exiting.");
     process.exit(0);
+  } catch (err) {
+    console.error("[Harness] Harness failed:", err instanceof Error ? err.message : err);
+    process.exit(1);
   } finally {
     process.off("SIGINT", handleSigint);
   }
@@ -613,6 +842,18 @@ async function parseArgs(): Promise<Config> {
       case "--branch": config.branch = args[++i]; break;
       case "--model": config.model = args[++i]; break;
       case "--claude-oauth-file": config.claudeOAuthFile = args[++i]; break;
+      case "--terminate": config.terminateExisting = true; break;
+      case "--review-agent": {
+        const val = args[++i];
+        if (val === "claude" || val === "codex") {
+          config.reviewAgent = val;
+        } else {
+          console.error(`Error: --review-agent must be 'claude' or 'codex', got '${val}'`);
+          process.exit(1);
+        }
+        break;
+      }
+      case "--codex-model": config.codexModel = args[++i]; break;
       case "-h": case "--help": printUsage(); process.exit(0);
       default:
         if (!arg.startsWith("-") && !config.projectName) {
@@ -671,14 +912,18 @@ Options:
   --branch <branch>        Git branch (default: main)
   --model <model>          Claude model: sonnet, opus, etc. (default: sonnet)
   --claude-oauth-file <f>  Path to Claude Code OAuth credentials JSON (default: ./.claude-code-credentials.json)
+  --review-agent <agent>   Code review agent: claude, codex (default: codex)
+  --codex-model <model>    Codex CLI model for review (default: codex's default)
 
 Environment:
   GITHUB_OWNER             Derive repo URL from owner + project name
   GITHUB_TOKEN             Required for private repos
   ANTHROPIC_API_KEY        Required if OAuth credentials not provided
+  OPENAI_API_KEY           Required when using --review-agent codex
 
 Example:
   npx tsx run.ts cowsay --instruction "Build a CLI that prints ASCII cow"
+  npx tsx run.ts myapp --instruction-file spec.txt --review-agent codex
 `);
 }
 

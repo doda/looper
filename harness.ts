@@ -1,6 +1,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { promisify } from "node:util";
 
 import {
@@ -10,6 +11,16 @@ import {
 } from "@anthropic-ai/claude-agent-sdk";
 
 const execFileAsync = promisify(execFile);
+
+/** Format timestamp as HH:MM:SS for log output */
+function ts(): string {
+  return new Date().toTimeString().slice(0, 8);
+}
+
+/** Log with timestamp prefix */
+function log(prefix: string, message: string): void {
+  console.log(`[${ts()}] [${prefix}] ${message}`);
+}
 
 /**
  * Configuration for the long-running project harness.
@@ -83,9 +94,41 @@ export interface LongRunningHarnessConfig {
    * process.env.GITHUB_TOKEN. Used via Authorization header; not logged.
    */
   gitToken?: string;
+
+  /**
+   * Enable the review agent ping-pong flow.
+   * When enabled, a separate review agent audits the working agent's changes
+   * and the working agent fixes issues until the review passes.
+   */
+  enableReviewAgent?: boolean;
+
+  /**
+   * Max review iterations before giving up.
+   * Default: 3
+   */
+  maxReviewIterations?: number;
+
+  /**
+   * Max turns for review agent sessions.
+   * Default: 30
+   */
+  maxReviewTurns?: number;
+
+  /**
+   * Which agent to use for code review.
+   * - "claude": Use Claude
+   * - "codex": Use OpenAI Codex CLI (default, requires @openai/codex installed)
+   */
+  reviewAgent?: "claude" | "codex";
+
+  /**
+   * Model to use for Codex CLI review.
+   * If not specified, uses Codex CLI default.
+   */
+  codexModel?: string;
 }
 
-export type HarnessPhase = "planning" | "working";
+export type HarnessPhase = "planning" | "working" | "review" | "fixing";
 
 interface ProjectPaths {
   taskList: string;
@@ -103,6 +146,20 @@ interface TaskSpec {
 }
 
 type TaskList = TaskSpec[];
+
+interface SessionResult {
+  sessionId: string | null;
+  success: boolean;
+  errors?: string[];
+  errorSubtype?: string;
+}
+
+interface ReviewResult {
+  sessionId: string | null;
+  passed: boolean;
+  issues: string[];
+  issuesPath?: string | null;
+}
 
 /**
  * LongRunningHarness implements a two-agent harness on top of the Claude Agent SDK:
@@ -134,6 +191,7 @@ export class LongRunningHarness {
   private readonly repositoryUrl: string;
   private readonly gitToken?: string;
   private readonly stopFilePath: string;
+  private lastReviewIssuesPath: string | null = null;
 
   constructor(cfg: LongRunningHarnessConfig) {
     this.cfg = cfg;
@@ -177,12 +235,12 @@ export class LongRunningHarness {
       const taskListValid = await this.isTaskListValid();
 
       if (taskListValid) {
-        console.log("[Harness] Project already initialized.");
+        log("Harness", "Project already initialized.");
         return;
       }
     }
 
-    console.log("[Harness] Project not fully initialized; running planning agent…");
+    log("Harness", "Project not fully initialized; running planning agent…");
     await this.runPlanningAgent();
   }
 
@@ -190,30 +248,31 @@ export class LongRunningHarness {
    * Run a single working session:
    *  - assumes planning already ran (or will run as needed)
    *  - asks Claude to pick one failing task and push it over the line
+   *
+   * Returns true if session completed successfully, false if it failed.
    */
-  async runWorkingSession(): Promise<void> {
-    console.log("[Harness] ═══════════════════════════════════════════════════════════");
-    console.log("[Harness] Starting working session");
-    console.log("[Harness] ═══════════════════════════════════════════════════════════");
+  async runWorkingSession(): Promise<boolean> {
+    log("Harness", "═══════════════════════════════════════════════════════════");
+    log("Harness", "Starting working session");
+    log("Harness", "═══════════════════════════════════════════════════════════");
 
     await this.ensureInitialized();
 
     const remaining = await this.countRemainingTasks();
     if (remaining != null) {
-      console.log(`[Harness] Remaining failing tasks: ${remaining}`);
+      log("Harness", `Remaining failing tasks: ${remaining}`);
     }
 
     const nextTask = await this.getNextFailingTask();
     if (nextTask) {
-      console.log(`[Harness] Next task to work on: ${nextTask.id} (${nextTask.category})`);
-      console.log(`[Harness]   Description: ${nextTask.description}`);
+      log("Harness", `Next task to work on: ${nextTask.id} (${nextTask.category})`);
+      log("Harness", `  Description: ${nextTask.description}`);
     }
     const isProjectSetup = nextTask?.id === "project-setup";
     if (isProjectSetup) {
-      console.log("[Harness] This is project-setup (scaffolding phase)");
+      log("Harness", "This is project-setup (scaffolding phase)");
     }
 
-    console.log("[Harness] Starting working agent session…");
     const options: Options = {
       ...this.buildBaseOptions("working"),
       maxTurns: this.cfg.maxWorkingTurns,
@@ -223,17 +282,225 @@ export class LongRunningHarness {
       ...this.cfg.sdkOptionsOverride,
     };
 
-    await this.runQuery(this.buildWorkingPrompt(isProjectSetup), options, "working");
+    // If review agent is enabled, use the ping-pong flow
+    if (this.cfg.enableReviewAgent && nextTask) {
+      return this.runWorkingSessionWithReview(nextTask, isProjectSetup, options);
+    }
 
-    console.log("[Harness] Working session complete, checking for commits to push...");
-    await this.pushIfNeeded("working");
-    console.log("[Harness] ═══════════════════════════════════════════════════════════");
+    // Original flow without review agent
+    log("Harness", "Starting working agent session…");
+    try {
+      await this.runQuery(this.buildWorkingPrompt(isProjectSetup, nextTask ?? undefined), options, "working");
+      log("Harness", "Working session complete, checking for commits to push...");
+      await this.pushIfNeeded("working");
+      log("Harness", "═══════════════════════════════════════════════════════════");
+      return true;
+    } catch (err) {
+      console.error("[Harness] ═══════════════════════════════════════════════════════════");
+      console.error("[Harness] Working session failed with error:");
+      console.error("[Harness]", err instanceof Error ? err.message : err);
+      console.error("[Harness] ═══════════════════════════════════════════════════════════");
+
+      // Still try to push any commits that were made before the failure
+      try {
+        await this.pushIfNeeded("working");
+      } catch (pushErr) {
+        console.warn("[Harness] Failed to push after error:", pushErr);
+      }
+
+      return false;
+    }
   }
+
+  /**
+   * Run working session with review agent ping-pong.
+   *
+   * Flow:
+   * 1. Working agent implements (maintains context)
+   * 2. Review agent audits (fresh context, adversarial)
+   * 3. If issues: working agent fixes (resumed context), then review re-audits (resumed)
+   * 4. Repeat until review passes or max iterations reached
+   * 5. Review agent marks task as complete (not working agent)
+   */
+  private async runWorkingSessionWithReview(
+    task: TaskSpec,
+    isProjectSetup: boolean,
+    options: Options
+  ): Promise<boolean> {
+    const maxIterations = this.cfg.maxReviewIterations ?? 3;
+
+    let workingSessionId: string | null = null;
+    let reviewSessionId: string | null = null;
+
+    log("Harness", "═══════════════════════════════════════════════════════════");
+    log("Harness", "Review agent enabled - using ping-pong flow");
+    log("Harness", "═══════════════════════════════════════════════════════════");
+
+    for (let iteration = 1; iteration <= maxIterations; iteration++) {
+      log("Harness", `─── Iteration ${iteration}/${maxIterations} ───`);
+
+      try {
+        // Phase 1: Working agent implements or fixes
+        if (workingSessionId === null) {
+          // First iteration: fresh implementation
+          log("Harness", "Starting working agent (implementation phase)…");
+          const workingPrompt = this.buildWorkingPromptForReview(isProjectSetup, task);
+          const result = await this.runQueryWithSessionCapture(workingPrompt, options, "working");
+          workingSessionId = result.sessionId;
+
+          if (!result.success) {
+            console.error("[Harness] Working agent failed during implementation");
+            // DO NOT push - revert to clean state
+            await this.syncRepoFromRemote();
+            return false;
+          }
+        } else {
+          // Subsequent iterations: resume with fix instructions
+          log("Harness", "Resuming working agent (fixing phase)…");
+          const lastIssues = this.lastReviewIssues ?? [];
+          const fixPrompt = this.buildFixPrompt(lastIssues, this.lastReviewIssuesPath);
+          const result = await this.resumeSession(workingSessionId, fixPrompt, options, "fixing");
+
+          if (!result.success) {
+            if (this.isPromptTooLong(result)) {
+              log("Harness", "Working agent resume failed due to prompt length; starting a fresh fix session...");
+              const freshPrompt = this.buildFixPrompt(lastIssues, this.lastReviewIssuesPath);
+              const freshResult = await this.runQueryWithSessionCapture(freshPrompt, options, "fixing");
+              workingSessionId = freshResult.sessionId;
+
+              if (!freshResult.success) {
+                console.error("[Harness] Working agent failed during fixing (fresh session)");
+                // DO NOT push - revert to clean state
+                await this.syncRepoFromRemote();
+                return false;
+              }
+            } else {
+              console.error("[Harness] Working agent failed during fixing");
+              // DO NOT push - revert to clean state
+              await this.syncRepoFromRemote();
+              return false;
+            }
+          }
+        }
+
+        // DO NOT push yet - wait for review approval
+        // Changes are committed locally but not pushed until review passes
+
+        // Check if task already passing and committed - skip review
+        const taskList = await this.readTaskList();
+        const currentTask = taskList.find((t) => t.id === task.id);
+        if (currentTask?.passes === true) {
+          log("Harness", `Task ${task.id} already marked passing - pushing`);
+          await this.pushIfNeeded("working");
+          return true;
+        }
+
+        // Phase 2: Review agent audits (default: codex)
+        const useCodex = this.cfg.reviewAgent !== "claude";
+        log("Harness", `Starting review agent (${useCodex ? "codex" : "claude"})…`);
+        let reviewResult: ReviewResult;
+        if (useCodex) {
+          reviewResult = await this.runCodexReview(task, iteration > 1);
+        } else {
+          reviewResult = await this.runReviewAgent(task, options, reviewSessionId);
+          reviewSessionId = reviewResult.sessionId;
+        }
+
+        if (reviewResult.passed) {
+          this.lastReviewIssuesPath = null;
+          // Verify the reviewer actually updated task_list.json
+          const taskList = await this.readTaskList();
+          const updatedTask = taskList.find((t) => t.id === task.id);
+          if (!updatedTask?.passes) {
+            console.warn(`[Harness] Review said PASS but task ${task.id} not marked as passing in task_list.json`);
+            console.warn("[Harness] Treating as failed review - reviewer must update task_list.json");
+            this.lastReviewIssues = ["Reviewer approved but did not update task_list.json"];
+            continue; // Go to next iteration
+          }
+
+          log("Harness", "═══════════════════════════════════════════════════════════");
+          log("Harness", `✓ Review agent APPROVED task: ${task.id}`);
+          log("Harness", "═══════════════════════════════════════════════════════════");
+          // Only push after review approval AND task marked passing
+          await this.pushIfNeeded("review");
+          return true;
+        }
+
+        // Store issues for next fix iteration
+        this.lastReviewIssues = reviewResult.issues;
+        this.lastReviewIssuesPath = reviewResult.issuesPath ?? this.lastReviewIssuesPath;
+        log("Harness", `Review agent found ${reviewResult.issues.length} issue(s):`);
+        for (const issue of reviewResult.issues) {
+          log("Harness", `  - ${issue}`);
+        }
+
+        if (iteration === maxIterations) {
+          console.error("[Harness] ═══════════════════════════════════════════════════════════");
+          console.error(`[Harness] ✗ Task ${task.id} failed review after ${maxIterations} iterations`);
+          console.error("[Harness] ═══════════════════════════════════════════════════════════");
+          // DO NOT push - review failed, don't commit bad code
+          // Revert local changes so next session starts clean
+          await this.syncRepoFromRemote();
+          return false;
+        }
+
+        log("Harness", "Sending issues to working agent for fixes...");
+
+      } catch (err) {
+        const errMsg = err instanceof Error ? err.message : String(err);
+
+        // OAuth token expiration - throw immediately to stop the harness
+        if (errMsg.toLowerCase().includes("oauth") || errMsg.includes("token revoked") || errMsg.includes("/login")) {
+          throw new Error(`Authentication expired: ${errMsg}`);
+        }
+
+        const isPromptTooLong = errMsg.toLowerCase().includes("prompt is too long") ||
+          errMsg.toLowerCase().includes("context length") ||
+          errMsg.toLowerCase().includes("too many tokens");
+
+        if (isPromptTooLong && workingSessionId !== null && this.lastReviewIssues.length > 0) {
+          // Prompt too long during resume - start fresh fix session
+          log("Harness", "Session context too long, starting fresh fix session...");
+          try {
+            const freshPrompt = this.buildFixPrompt(this.lastReviewIssues, this.lastReviewIssuesPath);
+            const freshResult = await this.runQueryWithSessionCapture(freshPrompt, options, "fixing");
+            workingSessionId = freshResult.sessionId;
+
+            if (freshResult.success) {
+              // Fresh session worked, continue to review
+              continue;
+            }
+          } catch (freshErr) {
+            log("Harness", `Fresh fix session also failed: ${freshErr instanceof Error ? freshErr.message : freshErr}`);
+          }
+        }
+
+        console.error("[Harness] ═══════════════════════════════════════════════════════════");
+        console.error(`[Harness] Error during iteration ${iteration}:`, errMsg);
+        console.error("[Harness] ═══════════════════════════════════════════════════════════");
+
+        // DO NOT push on error - revert to clean state
+        try {
+          await this.syncRepoFromRemote();
+        } catch (syncErr) {
+          console.warn("[Harness] Failed to sync after error:", syncErr);
+        }
+
+        return false;
+      }
+    }
+
+    return false;
+  }
+
+  // Store last review issues for fix prompt
+  private lastReviewIssues: string[] = [];
 
   /**
    * Convenience helper to run multiple working sessions until:
    *  - task_list.json has no failing tasks, or
    *  - we reach maxSessions
+   *  - we hit too many consecutive failures
    */
   async runUntilDone(maxSessions: number): Promise<void> {
     await this.ensureInitialized();
@@ -242,29 +509,60 @@ export class LongRunningHarness {
     const sessionLimit =
       maxSessions && maxSessions > 0 ? maxSessions : Number.MAX_SAFE_INTEGER;
 
+    const maxConsecutiveFailures = 3;
+    let consecutiveFailures = 0;
+    let successfulSessions = 0;
+
     for (let i = 0; i < sessionLimit; i++) {
       const remaining = await this.countRemainingTasks();
       if (remaining === 0) {
-        console.log("[Harness] All tasks are marked as passing. Nothing left to do.");
+        log("Harness", "All tasks are marked as passing. Nothing left to do.");
         return;
       }
 
-      const sessionLimit = maxSessions > 0 ? `of ${maxSessions}` : "(unlimited)";
+      const limitStr = maxSessions > 0 ? `of ${maxSessions}` : "(unlimited)";
       console.log(
-        `[Harness] ===== Working session #${i + 1} ${sessionLimit} | ${remaining ?? "?"} tasks remaining =====`
+        `[Harness] ===== Working session #${i + 1} ${limitStr} | ${remaining ?? "?"} tasks remaining =====`
       );
-      await this.runWorkingSession();
+
+      const success = await this.runWorkingSession();
+
+      if (success) {
+        consecutiveFailures = 0;
+        successfulSessions++;
+      } else {
+        consecutiveFailures++;
+        console.warn(
+          `[Harness] Session failed. Consecutive failures: ${consecutiveFailures}/${maxConsecutiveFailures}`
+        );
+
+        if (consecutiveFailures >= maxConsecutiveFailures) {
+          console.error(
+            `[Harness] Too many consecutive failures (${consecutiveFailures}). Stopping to prevent infinite loop.`
+          );
+          console.error(
+            `[Harness] Completed ${successfulSessions} successful sessions before failure.`
+          );
+          throw new Error(
+            `Harness stopped after ${consecutiveFailures} consecutive session failures`
+          );
+        }
+
+        // Brief delay before retrying to avoid hammering the API
+        log("Harness", "Waiting 10 seconds before retrying...");
+        await new Promise((resolve) => setTimeout(resolve, 10000));
+      }
 
       if (await this.shouldStopAfterSession()) {
-        console.log("[Harness] Stop requested; exiting after completing this session.");
+        log("Harness", "Stop requested; exiting after completing this session.");
         return;
       }
     }
 
     if (sessionLimit !== Number.MAX_SAFE_INTEGER) {
-      console.log("[Harness] Reached maxSessions limit.");
+      log("Harness", "Reached maxSessions limit.");
     } else {
-      console.log("[Harness] Stopping unlimited run loop.");
+      log("Harness", "Stopping unlimited run loop.");
     }
   }
 
@@ -317,20 +615,434 @@ export class LongRunningHarness {
   }
 
   /**
+   * INTERNAL: Run a query and capture the session ID for potential resume.
+   * Returns the session ID and success status.
+   */
+  private async runQueryWithSessionCapture(
+    prompt: string,
+    options: Options,
+    phase: HarnessPhase
+  ): Promise<SessionResult> {
+    const stream = query({ prompt, options });
+    let lastResult: SDKMessage | null = null;
+    let sessionId: string | null = null;
+
+    for await (const msg of stream) {
+      this.defaultLogMessage(msg, phase);
+      this.cfg.onMessage?.(msg, phase);
+
+      // Capture session ID from any message
+      if ("session_id" in msg && msg.session_id && !sessionId) {
+        sessionId = msg.session_id;
+      }
+
+      if (msg.type === "result") {
+        lastResult = msg;
+      }
+    }
+
+    const success = lastResult?.type === "result" && lastResult.subtype === "success";
+    const errorSubtype = lastResult?.type === "result" ? lastResult.subtype : undefined;
+    const errors = lastResult?.type === "result" ? lastResult.errors ?? [] : undefined;
+    log("Harness", `[${phase}] Session ended. success=${success}, lastResult.type=${lastResult?.type}, lastResult.subtype=${(lastResult as any)?.subtype}`);
+    return { sessionId, success, errors, errorSubtype };
+  }
+
+  /**
+   * INTERNAL: Resume a previous session with a new prompt.
+   */
+  private async resumeSession(
+    sessionId: string,
+    prompt: string,
+    options: Options,
+    phase: HarnessPhase
+  ): Promise<SessionResult> {
+    const resumeOptions: Options = {
+      ...options,
+      resume: sessionId,
+    };
+    return this.runQueryWithSessionCapture(prompt, resumeOptions, phase);
+  }
+
+  /**
+   * INTERNAL: Run the review agent and parse its findings.
+   */
+  private async runReviewAgent(
+    task: TaskSpec,
+    options: Options,
+    existingSessionId: string | null
+  ): Promise<ReviewResult> {
+    const reviewPrompt = existingSessionId
+      ? this.buildReviewContinuationPrompt(task)
+      : this.buildReviewPrompt(task);
+
+    const reviewOptions: Options = {
+      ...options,
+      maxTurns: this.cfg.maxReviewTurns ?? 100,
+      ...(existingSessionId ? { resume: existingSessionId } : {}),
+    };
+
+    const stream = query({ prompt: reviewPrompt, options: reviewOptions });
+    let sessionId: string | null = existingSessionId;
+    let lastAssistantText = "";
+
+    for await (const msg of stream) {
+      this.defaultLogMessage(msg, "review");
+      this.cfg.onMessage?.(msg, "review");
+
+      if ("session_id" in msg && msg.session_id && !sessionId) {
+        sessionId = msg.session_id;
+      }
+
+      // Capture assistant text for parsing review result
+      if (msg.type === "assistant") {
+        const content = (msg.message as any).content ?? [];
+        for (const block of content) {
+          if (block?.type === "text" && typeof block.text === "string") {
+            lastAssistantText += block.text + "\n";
+          }
+        }
+      }
+    }
+
+    // Parse review result from assistant output
+    const { passed, issues } = this.parseReviewResult(lastAssistantText);
+    const issuesPath = passed ? null : await this.writeReviewIssues(task, issues, "claude");
+
+    return { sessionId, passed, issues, issuesPath };
+  }
+
+  /**
+   * INTERNAL: Parse the review agent's output to determine pass/fail.
+   * Uses the LAST occurrence of REVIEW_RESULT since prompts may be echoed.
+   */
+  private parseReviewResult(text: string): { passed: boolean; issues: string[] } {
+    const sentinelMatches = [...text.matchAll(/<<<CODEX_REVIEW_RESULT:([a-zA-Z0-9-]+)>>>\s*([\s\S]*?)\s*<<<END_CODEX_REVIEW_RESULT:\1>>>/g)];
+    if (sentinelMatches.length > 0) {
+      const lastSentinel = sentinelMatches[sentinelMatches.length - 1];
+      const payloadRaw = (lastSentinel[2] ?? "").trim();
+      try {
+        const payload = JSON.parse(payloadRaw);
+        const result =
+          typeof payload?.result === "string"
+            ? payload.result.trim().toUpperCase()
+            : "";
+        if (result === "PASS") {
+          return { passed: true, issues: [] };
+        }
+        if (result === "FAIL") {
+          const issues = Array.isArray(payload?.issues)
+            ? payload.issues.map((issue: unknown) => String(issue)).filter((issue: string) => issue.trim().length > 0)
+            : [];
+          return { passed: false, issues: issues.length > 0 ? issues : ["Review failed (no specific issues listed)"] };
+        }
+      } catch {
+        // Fall through to legacy parsing.
+      }
+    }
+
+    // Find ALL occurrences of REVIEW_RESULT and use the LAST one
+    // (prompts contain FAIL as an example, actual result comes at the end)
+    const resultMatches = [...text.matchAll(/REVIEW_RESULT:\s*(PASS|FAIL)/gi)];
+
+    if (resultMatches.length > 0) {
+      const lastMatch = resultMatches[resultMatches.length - 1];
+      const verdict = lastMatch[1].toUpperCase();
+
+      if (verdict === "PASS") {
+        return { passed: true, issues: [] };
+      }
+
+      // FAIL - extract issues from text AFTER the last REVIEW_RESULT: FAIL
+      const issues: string[] = [];
+      const matchIndex = lastMatch.index ?? text.lastIndexOf("REVIEW_RESULT:");
+      const textAfterVerdict = text.slice(matchIndex);
+
+      const issuesSection = textAfterVerdict.match(/\*?\*?ISSUES:?\*?\*?\s*([\s\S]*?)(?=VERIFIED|REVIEW_RESULT|$)/i);
+      if (issuesSection) {
+        const content = issuesSection[1];
+        const issueLines = content.split("\n").filter((line) => {
+          const trimmed = line.trim();
+          return trimmed.startsWith("-") || /^\d+[\.\)]\s/.test(trimmed) || trimmed.startsWith("*");
+        });
+        for (const line of issueLines) {
+          const cleaned = line
+            .replace(/^[\s\-\*]+/, "")
+            .replace(/^\d+[\.\)]\s*/, "")
+            .replace(/\*\*/g, "")
+            .trim();
+          if (cleaned.length > 0) {
+            issues.push(cleaned);
+          }
+        }
+      }
+      return { passed: false, issues: issues.length > 0 ? issues : ["Review failed (no specific issues listed)"] };
+    }
+
+    // No explicit markers - look for problem indicators
+    const problemIndicators = [
+      /\#\[ignore\]/i,
+      /stub|placeholder|todo|fixme/i,
+      /not actually (test|run|verify)/i,
+      /tests? (are |were )?ignored/i,
+      /--no-run/i,
+    ];
+
+    for (const pattern of problemIndicators) {
+      if (pattern.test(text)) {
+        return { passed: false, issues: ["Review found potential issues (no explicit PASS)"] };
+      }
+    }
+
+    // Default to fail if no clear result
+    return { passed: false, issues: ["No explicit REVIEW_RESULT found"] };
+  }
+
+  private isPromptTooLong(result: SessionResult): boolean {
+    const errors = result.errors ?? [];
+    if (errors.length === 0) {
+      return false;
+    }
+    const combined = errors.join(" ").toLowerCase();
+    return (
+      combined.includes("prompt is too long") ||
+      combined.includes("context length") ||
+      combined.includes("maximum context") ||
+      combined.includes("max tokens") ||
+      combined.includes("too many tokens") ||
+      combined.includes("prompt too large")
+    );
+  }
+
+  private async writeReviewIssues(
+    task: TaskSpec,
+    issues: string[],
+    source: "codex" | "claude"
+  ): Promise<string | null> {
+    if (issues.length === 0) {
+      return null;
+    }
+    if (!(await pathExists(this.paths.gitDir))) {
+      return null;
+    }
+
+    const reviewDir = path.join(this.paths.gitDir, "looper-review");
+    const issuesPath = path.join(reviewDir, "issues.txt");
+    const content = [
+      `Task: ${task.id}`,
+      `Source: ${source}`,
+      `Timestamp: ${new Date().toISOString()}`,
+      "",
+      "Issues:",
+      ...issues.map((issue) => `- ${issue}`),
+      "",
+    ].join("\n");
+
+    try {
+      await fs.mkdir(reviewDir, { recursive: true });
+      await fs.writeFile(issuesPath, content, "utf8");
+      log("Harness", `Saved review issues to ${issuesPath}`);
+      return issuesPath;
+    } catch (err) {
+      console.warn("[Harness] Failed to write review issues file:", err);
+      return null;
+    }
+  }
+
+  /**
+   * INTERNAL: Run Codex CLI for code review.
+   * Executes `codex exec` with a review prompt and parses the output.
+   */
+  private async runCodexReview(
+    task: TaskSpec,
+    isRerun: boolean
+  ): Promise<ReviewResult> {
+    const reviewNonce = randomUUID();
+    const prompt = isRerun
+      ? this.buildCodexReviewContinuationPrompt(task, reviewNonce)
+      : this.buildCodexReviewPrompt(task, reviewNonce);
+
+    const model = this.cfg.codexModel;
+    log("Harness", `Running Codex CLI review (model=${model ?? "default"}, task=${task.id})`);
+
+    const args = ["exec"];
+    if (model) {
+      args.push("-m", model);
+    }
+    // Use --dangerously-bypass-approvals-and-sandbox since Modal is already sandboxed
+    args.push("--dangerously-bypass-approvals-and-sandbox", "--skip-git-repo-check", prompt);
+
+    return new Promise((resolve) => {
+      const proc = spawn("codex", args, {
+        cwd: this.workingDir,
+        env: {
+          ...process.env,
+          GIT_DIR: path.join(this.workingDir, ".git"),
+        },
+        stdio: ["pipe", "pipe", "pipe"],
+      });
+
+      let stdout = "";
+      let stderr = "";
+
+      // Filter to only log interesting lines (not full diffs/command output)
+      const shouldLog = (line: string): boolean => {
+        const trimmed = line.trim();
+        if (!trimmed) return false;
+        // Always show these
+        if (trimmed.startsWith("thinking")) return true;
+        if (trimmed.startsWith("**")) return true;  // thinking summaries
+        if (trimmed.includes("REVIEW_RESULT")) return true;
+        if (trimmed.includes("ISSUES:") || trimmed.includes("VERIFIED:")) return true;
+        if (trimmed.startsWith("- ") && stdout.includes("ISSUES:")) return true;  // issue list items
+        if (trimmed.includes("error") || trimmed.includes("Error")) return true;
+        // Show exec commands but not their output
+        if (trimmed === "exec") return true;
+        if (trimmed.startsWith("/bin/bash")) return true;
+        if (trimmed.includes("succeeded in") || trimmed.includes("failed in")) return true;
+        // Skip diff lines, file content, etc.
+        return false;
+      };
+
+      proc.stdout.on("data", (data: Buffer) => {
+        const text = data.toString();
+        stdout += text;
+        for (const line of text.split("\n")) {
+          if (shouldLog(line)) {
+            log("review", `codex: ${line.trim()}`);
+          }
+        }
+      });
+
+      proc.stderr.on("data", (data: Buffer) => {
+        const text = data.toString();
+        stderr += text;
+        for (const line of text.split("\n")) {
+          if (shouldLog(line)) {
+            log("review", `codex: ${line.trim()}`);
+          }
+        }
+      });
+
+      proc.on("close", (code) => {
+        void (async () => {
+          if (code !== 0) {
+            console.error(`[Harness] Codex CLI exited with code ${code}`);
+          }
+
+          // Parse the review result from codex output
+          const { passed, issues } = this.parseReviewResult(stdout + stderr);
+          const issuesPath = passed ? null : await this.writeReviewIssues(task, issues, "codex");
+
+          resolve({ sessionId: null, passed, issues, issuesPath });
+        })();
+      });
+
+      proc.on("error", (err) => {
+        console.error(`[Harness] Codex CLI spawn error: ${err.message}`);
+        resolve({
+          sessionId: null,
+          passed: false,
+          issues: [`Codex CLI spawn failed: ${err.message}`],
+        });
+      });
+    });
+  }
+
+  /**
+   * Build the Codex review prompt for initial review.
+   */
+  private buildCodexReviewPrompt(task: TaskSpec, reviewNonce: string): string {
+    return `You are a CODE REVIEWER auditing work on task: "${task.id}"
+
+Task description: ${task.description}
+
+IMPORTANT: The working agent has left changes UNCOMMITTED for you to review.
+The working agent already ran tests. Trust their results unless the code looks broken.
+
+REVIEW CHECKLIST:
+
+1. Check what changed: git status && git diff
+
+2. Verify the implementation meets the task description
+
+3. Look for obvious issues (bugs, missing error handling, incomplete implementation)
+
+REVIEW GUIDELINES:
+- Focus on correctness: does the code do what the task asks?
+- Fix minor issues yourself (typos, imports) rather than failing
+- Only re-run tests if code looks suspicious
+
+${this.buildCodexReviewOutputFormat(task.id, reviewNonce)}
+
+Begin your audit now.`;
+  }
+
+  /**
+   * Build the Codex review prompt for re-review after fixes.
+   */
+  private buildCodexReviewContinuationPrompt(task: TaskSpec, reviewNonce: string): string {
+    return `The working agent claims to have fixed the issues you identified for task "${task.id}".
+
+IMPORTANT: Changes are UNCOMMITTED. Check staged/unstaged changes, not commits.
+
+Re-verify:
+1. Run: git status and git diff to see current changes
+2. Check if each issue you raised has been addressed
+3. Look for any NEW issues introduced by the fixes
+
+Same guidelines: trust tests ran, fix minor issues yourself, only re-run if suspicious.
+
+${this.buildCodexReviewOutputFormat(task.id, reviewNonce)}`;
+  }
+
+  private buildCodexReviewOutputFormat(taskId: string, reviewNonce: string): string {
+    return `OUTPUT FORMAT (MACHINE READABLE ONLY):
+
+Return EXACTLY one block with valid JSON between the markers. Do not include any other text.
+
+<<<CODEX_REVIEW_RESULT:${reviewNonce}>>>
+{"result":"<PASS|FAIL>","issues":["<issue with file:line reference>"],"verified":["<what you verified>"],"tests":["<tests you ran>"]}
+<<<END_CODEX_REVIEW_RESULT:${reviewNonce}>>>
+
+If PASS, you MUST:
+1. Update task_list.json: set "passes": true for "${taskId}"
+2. Append to claude-progress.txt with a brief entry
+3. Stage ALL changes: git add -A
+4. Commit with message: "Complete ${taskId}: <brief description>"`;
+  }
+
+  /**
    * Ensure local working directory matches the remote GitHub repository if configured.
    * Clones when missing; otherwise fetches + hard resets to origin/<branch>.
    * Handles empty repos by initializing them locally first.
    */
   private async syncRepoFromRemote(): Promise<void> {
-    console.log(`[Harness] Syncing from remote: ${this.repositoryUrl} (branch: ${this.branch})`);
+    log("Harness", `Syncing from remote: ${this.repositoryUrl} (branch: ${this.branch})`);
     await this.ensureRemoteRepoExists();
     const repoExists = await pathExists(this.paths.gitDir);
+
+    // Clean up stale git lock files that may remain from crashed sandboxes
+    if (repoExists) {
+      const gitDir = path.join(this.workingDir, ".git");
+      try {
+        const files = await fs.readdir(gitDir);
+        for (const file of files) {
+          if (file.endsWith(".lock")) {
+            await fs.rm(path.join(gitDir, file), { force: true });
+          }
+        }
+      } catch {
+        // Ignore - directory may not exist or be readable
+      }
+    }
+
     const env = this.buildGitEnv();
     const branchRef = this.branch;
     const authUrl = this.getAuthenticatedRepoUrl();
 
     if (!repoExists) {
-      console.log(`[Harness] No local repo at ${this.workingDir}, cloning...`);
+      log("Harness", `No local repo at ${this.workingDir}, cloning...`);
       await fs.mkdir(this.workingDir, { recursive: true });
 
       // Try to clone; if it fails due to empty repo, initialize locally
@@ -341,24 +1053,24 @@ export class LongRunningHarness {
         );
         // Set the remote to the non-authenticated URL for display purposes
         await this.execGit(["-C", this.workingDir, "remote", "set-url", "origin", this.repositoryUrl], env);
-        console.log(`[Harness] ✓ Cloned repository successfully`);
+        log("Harness", `✓ Cloned repository successfully`);
         return;
       } catch (err: any) {
         const msg = err?.message ?? "";
         // Handle empty repo (no branches yet)
         if (msg.includes("Remote branch") && msg.includes("not found")) {
-          console.log("[Harness] Remote repo is empty, initializing locally...");
+          log("Harness", "Remote repo is empty, initializing locally...");
           await execFileAsync("git", ["init"], { cwd: this.workingDir, env });
           await execFileAsync("git", ["remote", "add", "origin", this.repositoryUrl], { cwd: this.workingDir, env });
           await execFileAsync("git", ["checkout", "-b", branchRef], { cwd: this.workingDir, env });
-          console.log(`[Harness] ✓ Initialized empty local repo`);
+          log("Harness", `✓ Initialized empty local repo`);
           return;
         }
         throw err;
       }
     }
 
-    console.log(`[Harness] Local repo exists, fetching and resetting to origin/${branchRef}...`);
+    log("Harness", `Local repo exists, fetching and resetting to origin/${branchRef}...`);
     // Update remote URL to authenticated version for fetch
     await this.execGit(["-C", this.workingDir, "remote", "set-url", "origin", authUrl], env);
     try {
@@ -366,12 +1078,12 @@ export class LongRunningHarness {
       await this.execGit(["-C", this.workingDir, "checkout", branchRef], env);
       await this.execGit(["-C", this.workingDir, "reset", "--hard", `origin/${branchRef}`], env);
       await this.execGit(["-C", this.workingDir, "clean", "-fd"], env);
-      console.log(`[Harness] ✓ Synced to origin/${branchRef}`);
+      log("Harness", `✓ Synced to origin/${branchRef}`);
     } catch (err: any) {
       const msg = err?.message ?? "";
       // Handle case where remote branch doesn't exist yet (empty repo)
       if (msg.includes("couldn't find remote ref")) {
-        console.log("[Harness] Remote branch doesn't exist yet, using local state...");
+        log("Harness", "Remote branch doesn't exist yet, using local state...");
       } else {
         throw err;
       }
@@ -409,12 +1121,12 @@ export class LongRunningHarness {
 
   private async execGit(args: string[], env: NodeJS.ProcessEnv): Promise<string> {
     const redactedArgs = args.map(a => a.replace(/x-access-token:[^@]+@/g, "x-access-token:***@"));
-    console.log(`[Harness] git ${redactedArgs.join(" ")}`);
+    log("Harness", `git ${redactedArgs.join(" ")}`);
     try {
       const result = await execFileAsync("git", args, { env });
       const stdout = result.stdout?.toString().trim();
       if (stdout) {
-        console.log(`[Harness] git output: ${stdout.substring(0, 200)}${stdout.length > 200 ? "..." : ""}`);
+        log("Harness", `git output: ${stdout.substring(0, 200)}${stdout.length > 200 ? "..." : ""}`);
       }
       return stdout ?? "";
     } catch (err: any) {
@@ -432,7 +1144,7 @@ export class LongRunningHarness {
 
   /** Push any unpushed commits to origin/<branch>. */
   private async pushIfNeeded(phase: HarnessPhase): Promise<void> {
-    console.log(`[Harness] Checking for unpushed commits (${phase})...`);
+    log("Harness", `Checking for unpushed commits (${phase})...`);
     const needsToken = this.requiresGithubToken(this.repositoryUrl);
     if (needsToken && !this.gitToken) {
       throw new Error(
@@ -442,14 +1154,28 @@ export class LongRunningHarness {
 
     const env = this.buildGitEnv();
 
+    // Check for uncommitted changes and auto-commit if needed
+    try {
+      const status = await execFileAsync("git", ["-C", this.workingDir, "status", "--porcelain"], { env });
+      const uncommitted = status.stdout.trim();
+      if (uncommitted) {
+        console.warn(`[Harness] Found uncommitted changes, auto-committing...`);
+        await execFileAsync("git", ["-C", this.workingDir, "add", "-A"], { env });
+        await execFileAsync("git", ["-C", this.workingDir, "commit", "-m", `Auto-commit uncommitted changes (${phase})`], { env });
+        log("Harness", `Auto-committed uncommitted changes`);
+      }
+    } catch (err) {
+      console.warn(`[Harness] Failed to check/commit uncommitted changes:`, err instanceof Error ? err.message : err);
+    }
+
     // Check if there are any commits at all
     let headSha: string | null = null;
     try {
       const result = await execFileAsync("git", ["-C", this.workingDir, "rev-parse", "HEAD"], { env });
       headSha = result.stdout.trim();
-      console.log(`[Harness] Current HEAD: ${headSha}`);
+      log("Harness", `Current HEAD: ${headSha}`);
     } catch {
-      console.log(`[Harness] No commits yet, nothing to push.`);
+      log("Harness", `No commits yet, nothing to push.`);
       return;
     }
 
@@ -464,37 +1190,37 @@ export class LongRunningHarness {
         { env }
       );
       unpushedCommits = result.stdout.trim().split("\n").filter(Boolean);
-      console.log(`[Harness] Unpushed commits: ${unpushedCommits.length}`);
+      log("Harness", `Unpushed commits: ${unpushedCommits.length}`);
       for (const commit of unpushedCommits) {
-        console.log(`[Harness]   - ${commit}`);
+        log("Harness", `  - ${commit}`);
       }
     } catch {
       // origin/<branch> doesn't exist yet, so all local commits are unpushed
-      console.log(`[Harness] Remote branch origin/${this.branch} not found, all commits are unpushed`);
+      log("Harness", `Remote branch origin/${this.branch} not found, all commits are unpushed`);
       unpushedCommits = ["all"];
     }
 
     if (unpushedCommits.length === 0) {
-      console.log(`[Harness] No unpushed commits after ${phase} phase.`);
+      log("Harness", `No unpushed commits after ${phase} phase.`);
       return;
     }
 
     // Pull (rebase) then push to origin
     const authUrl = this.getAuthenticatedRepoUrl();
-    console.log(`[Harness] Pushing to origin/${this.branch}...`);
+    log("Harness", `Pushing to origin/${this.branch}...`);
     try {
       // First, try to pull with rebase in case remote has new commits
       try {
-        console.log(`[Harness] Attempting pull --rebase first...`);
+        log("Harness", `Attempting pull --rebase first...`);
         await this.execGit(["-C", this.workingDir, "pull", "--rebase", authUrl, this.branch], env);
       } catch (pullErr) {
         // Pull may fail if remote branch doesn't exist yet, that's OK
-        console.log(`[Harness] Pull --rebase skipped or failed (may be expected):`, pullErr instanceof Error ? pullErr.message : pullErr);
+        log("Harness", `Pull --rebase skipped or failed (may be expected): ${pullErr instanceof Error ? pullErr.message : pullErr}`);
       }
       // Use -u to set upstream if this is the first push
-      console.log(`[Harness] Executing push...`);
+      log("Harness", `Executing push...`);
       await this.execGit(["-C", this.workingDir, "push", "-u", authUrl, this.branch], env);
-      console.log(`[Harness] ✓ Successfully pushed ${unpushedCommits.length} commit(s) to origin/${this.branch} (${phase}).`);
+      log("Harness", `✓ Successfully pushed ${unpushedCommits.length} commit(s) to origin/${this.branch} (${phase}).`);
     } catch (err) {
       console.error(`[Harness] ✗ Failed to push to origin/${this.branch}:`, err);
       throw new Error(
@@ -622,7 +1348,13 @@ CRITICAL WARNING - DO NOT KILL ALL NODE PROCESSES:
 - NEVER run: pkill -f "npm|node|vite" or killall node
 - The harness itself runs on Node.js - killing all node processes kills the harness!
 - To free a specific port: lsof -ti:PORT | xargs kill -9
-- To kill a specific process: pkill -f "specific-process-name"`;
+- To kill a specific process: pkill -f "specific-process-name"
+
+CRITICAL WARNING - FILE SIZE LIMITS:
+- The Read tool has a 25,000 token limit (~100KB). Large source files WILL cause errors.
+- For large files: Use the "offset" and "limit" parameters to read specific portions
+- Prefer using Grep to search for specific patterns instead of reading entire files
+- When editing large files, use Edit tool which works on specific sections`;
 
     if (phase === "planning") {
       return `You are the PLANNING agent for a Looper-managed project.
@@ -631,6 +1363,14 @@ in the project spec. Do NOT implement any tasks or scaffold the project.
 Project setup is the FIRST task in the list for a working agent to implement.
 Create coordination artifacts (task_list.json, claude-progress.txt, init.sh,
 CLAUDE.md) for future working agents. Work on branch ${this.branch}.
+${envInfo}`;
+    }
+
+    if (phase === "review") {
+      return `You are an independent CODE REVIEWER auditing work done by another agent.
+You have NO context of how the code was implemented. Your job is to find problems,
+verify tests actually run and pass, and catch cheating patterns like ignored tests
+or stub implementations. Be skeptical. Work on branch ${this.branch}.
 ${envInfo}`;
     }
 
@@ -697,10 +1437,10 @@ In this session you must:
 
 3) Create claude-progress.txt at the repo root
    - Start a running log for future agents.
-   - Include:
-       - Summary of the project requirements from your analysis.
+   - Keep it concise (under 20 lines). Include:
+       - Brief summary of project requirements.
        - Total number of tasks identified.
-       - Recommended approach/architecture (high-level suggestions only).
+       - Recommended approach/architecture (high-level only).
        - Note that the first working agent should start with "project-setup".
 
 4) Create a placeholder init.sh script at the repo root
@@ -721,7 +1461,12 @@ In this session you must:
        - Recommend a stack/approach (the working agent will make final decisions).
    - Keep it concise—this is the first thing agents read.
 
-6) Initialize git
+6) Copy the project spec to SPEC.md at the repo root
+   - Run: cp /harness/spec.txt SPEC.md
+   - This allows future working agents to reference detailed requirements.
+   - Do NOT write it manually — just copy the file.
+
+7) Initialize git
    - If no git repo exists, initialize one and set origin to the remote.
    - Add all files and commit with message: "Initial planning: task list and coordination artifacts"
    - Do NOT run "git push" — the harness pushes automatically after your session.
@@ -742,7 +1487,21 @@ CRITICAL RULES:
    * Prompt for working sessions.
    * @param isProjectSetup - If true, includes detailed scaffolding instructions
    */
-  private buildWorkingPrompt(isProjectSetup: boolean): string {
+  private buildWorkingPrompt(isProjectSetup: boolean, task?: TaskSpec): string {
+    const taskAssignment = task && !isProjectSetup
+      ? `
+═══════════════════════════════════════════════════════════════════════════════
+ASSIGNED TASK: ${task.id}
+Category: ${task.category}
+Description: ${task.description}
+Steps to verify:
+${task.steps.map((s, i) => `  ${i + 1}. ${s}`).join("\n")}
+═══════════════════════════════════════════════════════════════════════════════
+
+You MUST work on this specific task. Do NOT choose a different task.
+`
+      : "";
+
     const projectSetupSection = isProjectSetup
       ? `
 IMPORTANT: You are working on the "project-setup" task.
@@ -765,9 +1524,8 @@ This means the project has NOT been scaffolded yet. Your job is to:
    - Run "./init.sh --quick" (fast mode, ~30 seconds).
    - If it fails, dedicate this session to fixing the environment first.
      * Repair dependencies, scripts, or configuration until init.sh succeeds.
-     * Document what you fixed in claude-progress.txt.
      * Do NOT mark any tasks as passing while the environment is broken.
-   - Do NOT wait for init.sh to complete before proceeding - just verify it starts successfully.
+   - Once init.sh starts successfully, proceed with your task.
 `;
 
     return `
@@ -776,19 +1534,21 @@ You are a working agent on a long-running project.
 Multiple agents will work on this repo across many sessions. You do not have
 access to their conversations; you only see the repo, scripts, tests, and
 git history.
-${projectSetupSection}
-Key artifacts you should rely on (ALL at repo root, not in subdirectories):
+${taskAssignment}${projectSetupSection}
+Key coordination artifacts (ALL at repo root):
 - CLAUDE.md — project context and guidelines (read this first).
+- SPEC.md — the FULL original project specification (reference for detailed requirements).
 - task_list.json — list of end-to-end tasks with a "passes" flag.
-- claude-progress.txt — log of previous work and instructions (ALWAYS at repo root).
+- claude-progress.txt — log of previous work and instructions.
 - init.sh — script to start the environment and run smoke tests.
 - git log — history of previous changes.
 
-IMPORTANT: Always write to files at the REPO ROOT, not in subdirectories like backend/ or frontend/.
+NOTE: Coordination artifacts (task_list.json, claude-progress.txt, init.sh) go at repo root.
+Project source code goes in appropriate subdirectories (src/, backend/, frontend/, etc.).
 
 Your job in this session is to:
   1. Get oriented.
-  2. Choose a single failing task.
+  2. ${task ? "Confirm your assigned task (see above)." : "Find the first failing task in task_list.json."}
   3. Implement it end-to-end.
   4. Verify it thoroughly.
   5. Leave the environment in a clean, working state.
@@ -802,10 +1562,13 @@ Follow this checklist strictly:
    - Inspect recent git history (e.g. "git log --oneline -20").
    - Open task_list.json.
 
-2) Choose a task
+2) ${task ? `Confirm your assigned task: "${task.id}"
+   - Your task is already specified above. Do NOT pick a different task.
+   - Review the task description and verification steps.
+   - Work on THIS task only in this session.` : `Choose a task
    - Find the highest-priority task whose "passes" flag is false.
    - Tasks are ordered by dependency—work from top to bottom.
-   - Work on ONE task only in this session.
+   - Work on ONE task only in this session.`}
 ${verifyEnvironmentSection}
 ${isProjectSetup ? "3" : "4"}) Implement the chosen task
    - Plan the change at a high level before editing.
@@ -836,14 +1599,15 @@ ${isProjectSetup ? "6" : "7"}) Update coordination artifacts ONLY when the task 
        - It is unacceptable to delete or weaken tests just to make a task appear passing.
        - Do not remove or rename other tasks.
    - In claude-progress.txt:
-       - Append an entry summarizing:
+       - Append a BRIEF entry (aim for 3-5 lines) noting:
            - Which task you worked on (by id).
-           - Files and modules you changed.
-           - How you tested the behavior.
-           - Any limitations, TODOs, or follow-up work for future agents.
+           - Key files changed.
+           - How you verified it works.
+           - Any blockers or TODOs for future agents.
+       - Be concise—future agents skim this log, they don't read essays.
 
 ${isProjectSetup ? "7" : "8"}) Commit your work
-   - Ensure tests and ./init.sh succeed.
+   - Run tests and ./init.sh to verify everything works (must pass fully).
    - Ensure there are no stray debug artifacts or half-done migrations.
    - Create a focused git commit with a descriptive message tied to the task.
    - Do NOT run "git push" — the harness pushes automatically after your session.
@@ -856,6 +1620,14 @@ Important constraints:
 - If you finish early, invest remaining time in improving tests, docs,
   or small refactors that make future sessions more effective, but do not
   rush to take on a second major task.
+- If you hit a blocker (library issues, missing APIs, unclear errors), create an
+  investigation task and move on. Don't abandon libraries for hacky workarounds.
+- If you discover missing features/prerequisites: fix them now if feasible, otherwise
+  add them as new tasks in task_list.json with "passes": false and move on.
+- Do NOT redefine task requirements to claim success:
+    * "Identical failures" is NOT "identical behavior" - things must actually work
+    * If a task says "produce and consume records", records must actually be produced and consumed
+    * If you can't make it work, mark the task as failing - don't rationalize that broken = complete
 
 Throughout your response:
 - Explain what you are doing and why.
@@ -863,6 +1635,200 @@ Throughout your response:
 - When you test behavior, describe the exact commands or steps you ran.
 
 Begin by summarizing what you see in the repo and which task you plan to tackle.
+`;
+  }
+
+  /**
+   * Build the working prompt for review mode - implementation without marking complete.
+   */
+  private buildWorkingPromptForReview(isProjectSetup: boolean, task: TaskSpec): string {
+    const basePrompt = this.buildWorkingPrompt(isProjectSetup, task);
+
+    // Append a strong override at the end - more robust than regex replacement
+    return `${basePrompt}
+
+═══════════════════════════════════════════════════════════════════════════════
+CRITICAL OVERRIDE - REVIEW MODE ACTIVE
+═══════════════════════════════════════════════════════════════════════════════
+You are in REVIEW MODE. A separate review agent will audit your work.
+
+DO NOT:
+- Update task_list.json to set "passes": true
+- Write to claude-progress.txt
+- Mark the task as complete in any way
+- Run "git commit" - leave your changes UNCOMMITTED
+
+DO:
+- Implement the task fully
+- Run tests and verify they pass
+- Stage your changes with "git add" but DO NOT COMMIT
+- The review agent will verify, update task_list.json, and commit everything together
+═══════════════════════════════════════════════════════════════════════════════`;
+  }
+
+  /**
+   * Prompt for fixing issues found by the review agent.
+   */
+  private buildFixPrompt(issues: string[], issuesPath?: string | null): string {
+    const maxIssues = 10;
+    const shownIssues = issues.slice(0, maxIssues);
+    const issueList = shownIssues.map((issue, i) => `${i + 1}. ${issue}`).join("\n");
+    const remainingCount = issues.length - shownIssues.length;
+    const extraNote =
+      remainingCount > 0
+        ? `\n(+${remainingCount} more${issuesPath ? `; see ${issuesPath}` : ""})`
+        : "";
+    const fileNote = issuesPath ? `\nFull issue list saved at: ${issuesPath}` : "";
+
+    return `
+The code review found the following issues with your implementation:
+
+${issueList}${extraNote}${fileNote}
+
+You must fix ALL of these issues. The review agent will verify each fix.
+
+Rules:
+- DO NOT ask questions or present options - just do the work
+- Actually fix the issues, don't just dismiss them or work around them
+- If a test needs to run, make it run (set up dependencies, don't just #[ignore] it)
+- If something is a stub, implement it fully
+- If tests are marked #[ignore], remove the ignore and make them pass
+- Show your work: run the tests, show they pass
+- Do NOT redefine requirements to claim success (e.g., "identical failures = identical behavior")
+- If code doesn't work, fix it or mark the task as failing - don't rationalize
+
+If you discover missing prerequisites: fix them now if feasible, otherwise add them
+as new tasks with "passes": false and move on to something you can complete.
+
+After completing your work:
+- Stage your changes with "git add" but DO NOT COMMIT
+- The review agent will verify and commit everything together if it passes
+`;
+  }
+
+  /**
+   * Prompt for the review agent (fresh context, adversarial).
+   */
+  private buildReviewPrompt(task: TaskSpec): string {
+    return `
+You are an independent CODE REVIEWER auditing work on task: "${task.id}"
+
+Task description: ${task.description}
+
+You have NO context of how this was implemented. You must verify independently.
+
+IMPORTANT: The working agent has left changes UNCOMMITTED for you to review.
+You will see staged/unstaged changes, not commits.
+
+YOUR JOB IS TO FIND PROBLEMS. Be skeptical. Assume the implementation may be:
+- Incomplete (stubs, placeholders, TODOs left in code)
+- Untested (tests don't actually run, are ignored, or don't verify behavior)
+- Gaming metrics (marking things complete without real verification)
+
+AUDIT CHECKLIST:
+
+1. Check what changed (the working agent left changes uncommitted):
+   - Run: git status
+   - Run: git diff --stat
+   - Run: git diff (for unstaged) and git diff --cached (for staged)
+
+2. Look for cheating patterns:
+   - Run: grep -r "#\\[ignore\\]" on test files (tests that are skipped)
+   - Run: grep -r "TODO\\|FIXME\\|unimplemented\\|todo!" on changed files
+   - Check if tests use "--no-run" (compilation only, no execution)
+
+3. Actually run the tests:
+   - Find and run the relevant test command (cargo test, npm test, pytest, etc.)
+   - Verify tests ACTUALLY EXECUTE (not just compile)
+   - Check the output shows tests running and passing
+
+4. Verify the implementation:
+   - Does the code actually do what the task description says?
+   - Are there stub/placeholder implementations?
+   - Is error handling real or just "// TODO: handle errors"?
+
+5. Check for deferred work:
+   - "Ready to run" but never actually run
+   - "Infrastructure complete" but no actual functionality
+   - Tests that test infrastructure, not behavior
+
+RED FLAGS (automatic fail):
+- Tests marked #[ignore] that should run
+- "cargo test --no-run" used as verification
+- Stub implementations (unimplemented!(), todo!(), pass, ...)
+- TODOs in the implementation code
+- Tests that don't assert anything meaningful
+- "This will be implemented later" comments
+- Abandoning proper libraries for manual implementations without justification
+  (e.g., "had version issues" so switched to manual byte encoding)
+- Using old/deprecated API versions when modern ones should work
+- Redefining task requirements to claim success (e.g., "identical failures count as identical behavior")
+- Rationalizing that broken code meets requirements through creative interpretation
+
+OUTPUT FORMAT (you MUST use this exact format at the end):
+
+If issues found:
+REVIEW_RESULT: FAIL
+ISSUES:
+- <issue 1 with file:line reference>
+- <issue 2 with file:line reference>
+...
+
+If everything passes:
+REVIEW_RESULT: PASS
+VERIFIED:
+- <what you verified>
+- <tests you ran and their output>
+
+Then, if PASS, you MUST do ALL of the following in ONE ATOMIC COMMIT:
+1. Update task_list.json: set "passes": true for "${task.id}"
+2. Append to claude-progress.txt with a brief entry noting the task was reviewed and approved
+3. Stage ALL changes: git add -A
+4. Commit EVERYTHING together (implementation + task updates) with message:
+   "Complete ${task.id}: <brief description of what was implemented>"
+
+This ensures the implementation and task completion are in ONE commit, not separate commits.
+
+Begin your audit now.
+`;
+  }
+
+  /**
+   * Prompt for continuing a review session after fixes.
+   */
+  private buildReviewContinuationPrompt(task: TaskSpec): string {
+    return `
+The working agent claims to have fixed the issues you identified.
+
+IMPORTANT: Changes are UNCOMMITTED. Check staged/unstaged changes, not commits.
+
+Re-verify:
+1. Run: git status and git diff to see current changes
+2. Check if each issue you raised has been addressed
+3. Run the tests again to confirm they pass
+4. Look for any NEW issues introduced by the fixes
+
+Be thorough. Don't just trust claims - verify independently.
+
+OUTPUT FORMAT:
+
+If issues remain or new issues found:
+REVIEW_RESULT: FAIL
+ISSUES:
+- <remaining/new issue with file:line reference>
+...
+
+If ALL issues are fixed:
+REVIEW_RESULT: PASS
+VERIFIED:
+- <what you verified>
+
+If PASS, you MUST do ALL of the following in ONE ATOMIC COMMIT:
+1. Update task_list.json: set "passes": true for "${task.id}"
+2. Append to claude-progress.txt with a brief entry
+3. Stage ALL changes: git add -A
+4. Commit EVERYTHING together with message:
+   "Complete ${task.id}: <brief description>"
 `;
   }
 
@@ -986,13 +1952,9 @@ Begin by summarizing what you see in the repo and which task you plan to tackle.
     switch (msg.type) {
       case "system":
         if (msg.subtype === "init") {
-          console.log(
-            `[${phase}] Session started (model=${msg.model}, permissionMode=${msg.permissionMode})`
-          );
+          log(phase, `Session started (model=${msg.model}, permissionMode=${msg.permissionMode})`);
         } else if (msg.subtype === "compact_boundary") {
-          console.log(
-            `[${phase}] --- context compacted (trigger=${msg.compact_metadata.trigger}, pre_tokens=${msg.compact_metadata.pre_tokens})`
-          );
+          log(phase, `--- context compacted (trigger=${msg.compact_metadata.trigger}, pre_tokens=${msg.compact_metadata.pre_tokens})`);
         }
         break;
 
@@ -1001,11 +1963,11 @@ Begin by summarizing what you see in the repo and which task you plan to tackle.
         const content = (msg.message as any).content ?? [];
         for (const block of content) {
           if (block?.type === "text" && typeof block.text === "string") {
-            console.log(`[${phase}] assistant: ${block.text}`);
+            log(phase, `assistant: ${block.text}`);
           } else if (block?.type === "tool_use") {
             // Log tool name and a brief summary of input
             const inputSummary = this.summarizeToolInput(block.name, block.input);
-            console.log(`[${phase}] tool: ${block.name}${inputSummary ? ` (${inputSummary})` : ""}`);
+            log(phase, `tool: ${block.name}${inputSummary ? ` (${inputSummary})` : ""}`);
           }
         }
         break;
@@ -1013,16 +1975,10 @@ Begin by summarizing what you see in the repo and which task you plan to tackle.
 
       case "result":
         if (msg.subtype === "success") {
-          console.log(
-            `[${phase}] ✓ result: turns=${msg.num_turns}, duration=${msg.duration_ms}ms, cost=$${msg.total_cost_usd.toFixed(
-              4
-            )}`
-          );
+          log(phase, `✓ result: turns=${msg.num_turns}, duration=${msg.duration_ms}ms, cost=$${msg.total_cost_usd.toFixed(4)}`);
         } else {
           console.warn(
-            `[${phase}] ✗ result (${msg.subtype}): turns=${msg.num_turns}, errors=${msg.errors?.join(
-              "; "
-            )}`
+            `[${ts()}] [${phase}] ✗ result (${msg.subtype}): turns=${msg.num_turns}, errors=${msg.errors?.join("; ")}`
           );
         }
         break;

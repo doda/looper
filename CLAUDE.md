@@ -31,6 +31,41 @@ Target projects managed by Looper use these files for cross-session coordination
 
 **Working Agent:** Implements tasks one at a time, starting with `project-setup` which scaffolds the project. Each session picks one failing task, implements it, tests it, and marks it passing.
 
+## Task Completion Rules
+
+A task is **only passing** when:
+- All tests RUN and PASS (not ignored, not skipped, not pending)
+- The feature actually works end-to-end
+
+**If a task is blocked** by missing functionality:
+1. **DO NOT** mark the task as passing with ignored/stubbed tests
+2. **DO NOT** create "infrastructure" or "scaffolding" without working tests
+3. **DO** identify what's missing and add those as new tasks in `task_list.json`
+4. **DO** move the blocked task after its new prerequisite tasks
+5. **DO** pick a different task that CAN be completed NOW
+
+Example: If `test-java-client-interop` needs produce/fetch APIs that don't work yet:
+- Add `produce-api-basic` and `fetch-api-basic` tasks if they don't exist
+- Move `test-java-client-interop` after those tasks in the list
+- Work on something else that's completable
+
+Never fake progress. If tests don't actually run and pass, the task isn't done.
+
+## Verification-Driven Development
+
+When working on `verify-*` tasks:
+
+1. **Run verification** against the reference implementation (Java Kafka)
+2. **Capture divergences** - any differences in behavior, responses, or error codes
+3. **Create fix tasks** - for each divergence found, add a new `fix-*` task to `task_list.json`:
+   - Use descriptive ID like `fix-produce-wrong-error-code` or `fix-metadata-missing-field`
+   - Include the specific divergence details in the description
+   - Place fix tasks before the verification task that found them
+4. **Mark verification as passing** only when it finds ZERO divergences
+5. **Repeat** - after fixes are done, re-run verification to confirm and find more issues
+
+The goal is a continuous loop: verify → find issues → create fix tasks → fix → verify again. Keep creating tasks until the codebase fully matches the reference implementation.
+
 ## Code Quality: Avoid AI Slop
 
 After implementing but **before testing**, review your diff and remove patterns inconsistent with the codebase:
