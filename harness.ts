@@ -383,7 +383,7 @@ export class LongRunningHarness {
 
     // If review agent is enabled, use the ping-pong flow
     if (this.cfg.enableReviewAgent && nextTask) {
-      return this.runWorkingSessionWithReview(nextTask, isProjectSetup, options, false);
+      return this.runWorkingSessionWithReview(nextTask, isProjectSetup, options);
     }
 
     // Original flow without review agent
@@ -412,9 +412,8 @@ export class LongRunningHarness {
 
   /**
    * Run a single working session for a specific task.
-   * Used by parallel workers that must not update coordination artifacts.
    */
-  async runSingleTask(taskId: string, workerMode = false): Promise<boolean> {
+  async runSingleTask(taskId: string): Promise<boolean> {
     log("Harness", `Starting single-task session for: ${taskId}`);
 
     await this.ensureInitialized();
@@ -435,12 +434,10 @@ export class LongRunningHarness {
     };
 
     if (this.cfg.enableReviewAgent) {
-      return this.runWorkingSessionWithReview(task, isProjectSetup, options, workerMode);
+      return this.runWorkingSessionWithReview(task, isProjectSetup, options);
     }
 
-    const prompt = workerMode
-      ? this.buildWorkingPromptForWorker(isProjectSetup, task)
-      : this.buildWorkingPrompt(isProjectSetup, task);
+    const prompt = this.buildWorkingPrompt(isProjectSetup, task);
 
     try {
       await this.runQuery(prompt, options, "working");
@@ -476,8 +473,7 @@ export class LongRunningHarness {
   private async runWorkingSessionWithReview(
     task: TaskSpec,
     isProjectSetup: boolean,
-    options: Options,
-    workerMode = false
+    options: Options
   ): Promise<boolean> {
     const maxIterations = this.cfg.maxReviewIterations ?? 3;
 
@@ -496,9 +492,7 @@ export class LongRunningHarness {
         if (workingSessionId === null) {
           // First iteration: fresh implementation
           log("Harness", "Starting working agent (implementation phase)…");
-          const workingPrompt = workerMode
-            ? this.buildWorkingPromptForWorkerReview(isProjectSetup, task)
-            : this.buildWorkingPromptForReview(isProjectSetup, task);
+          const workingPrompt = this.buildWorkingPromptForReview(isProjectSetup, task);
           const result = await this.runQueryWithSessionCapture(workingPrompt, options, "working");
           workingSessionId = result.sessionId;
 
@@ -512,19 +506,15 @@ export class LongRunningHarness {
           // Subsequent iterations: resume with fix instructions
           log("Harness", "Resuming working agent (fixing phase)…");
           const lastIssues = this.lastReviewIssues ?? [];
-          const fixPrompt = workerMode
-            ? this.buildFixPromptForWorker(lastIssues, this.lastReviewIssuesPath)
-            : this.buildFixPrompt(lastIssues, this.lastReviewIssuesPath);
+          const fixPrompt = this.buildFixPrompt(lastIssues, this.lastReviewIssuesPath);
           const result = await this.resumeSession(workingSessionId, fixPrompt, options, "fixing");
 
           if (!result.success) {
             if (this.isPromptTooLong(result)) {
               log("Harness", "Working agent resume failed due to prompt length; starting a fresh fix session...");
-            const freshPrompt = workerMode
-              ? this.buildFixPromptForWorker(lastIssues, this.lastReviewIssuesPath)
-              : this.buildFixPrompt(lastIssues, this.lastReviewIssuesPath);
-            const freshResult = await this.runQueryWithSessionCapture(freshPrompt, options, "fixing");
-            workingSessionId = freshResult.sessionId;
+              const freshPrompt = this.buildFixPrompt(lastIssues, this.lastReviewIssuesPath);
+              const freshResult = await this.runQueryWithSessionCapture(freshPrompt, options, "fixing");
+              workingSessionId = freshResult.sessionId;
 
               if (!freshResult.success) {
                 logError("Harness", "Working agent failed during fixing (fresh session)");
@@ -542,7 +532,7 @@ export class LongRunningHarness {
         }
 
         // DO NOT push yet - wait for review approval
-        // Changes are committed locally but not pushed until review passes
+        // Changes remain local (staged/unstaged) until review passes
 
         // Check if task already passing and committed - skip review
         const taskList = await this.readTaskList();
@@ -558,35 +548,29 @@ export class LongRunningHarness {
         log("Harness", `Starting review agent (${useCodex ? "codex" : "claude"})…`);
         let reviewResult: ReviewResult;
         if (useCodex) {
-          reviewResult = await this.runCodexReview(task, iteration > 1, workerMode);
+          reviewResult = await this.runCodexReview(task, iteration > 1);
         } else {
-          reviewResult = await this.runReviewAgent(task, options, reviewSessionId, workerMode);
+          reviewResult = await this.runReviewAgent(task, options, reviewSessionId);
           reviewSessionId = reviewResult.sessionId;
         }
 
         if (reviewResult.passed) {
           this.lastReviewIssuesPath = null;
-          if (!workerMode) {
-            // Verify the reviewer actually updated task_list.json
-            const taskList = await this.readTaskList();
-            const updatedTask = taskList.find((t) => t.id === task.id);
-            if (!updatedTask?.passes) {
-              logWarn("Harness", `Review said PASS but task ${task.id} not marked as passing in task_list.json`);
-              logWarn("Harness", "Treating as failed review - reviewer must update task_list.json");
-              this.lastReviewIssues = ["Reviewer approved but did not update task_list.json"];
-              continue; // Go to next iteration
-            }
+          // Verify the reviewer actually updated task_list.json
+          const taskList = await this.readTaskList();
+          const updatedTask = taskList.find((t) => t.id === task.id);
+          if (!updatedTask?.passes) {
+            logWarn("Harness", `Review said PASS but task ${task.id} not marked as passing in task_list.json`);
+            logWarn("Harness", "Treating as failed review - reviewer must update task_list.json");
+            this.lastReviewIssues = ["Reviewer approved but did not update task_list.json"];
+            continue; // Go to next iteration
           }
 
           log("Harness", "═══════════════════════════════════════════════════════════");
           log("Harness", `✓ Review agent APPROVED task: ${task.id}`);
           log("Harness", "═══════════════════════════════════════════════════════════");
-          // Only push after review approval (and task marked passing in controller mode)
-          if (workerMode) {
-            await this.finalizeWorkerTask(task);
-          } else {
-            await this.pushIfNeeded("review");
-          }
+          // Only push after review approval (and task marked passing)
+          await this.pushIfNeeded("review");
           return true;
         }
 
@@ -626,9 +610,7 @@ export class LongRunningHarness {
           // Prompt too long during resume - start fresh fix session
           log("Harness", "Session context too long, starting fresh fix session...");
           try {
-            const freshPrompt = workerMode
-              ? this.buildFixPromptForWorker(this.lastReviewIssues, this.lastReviewIssuesPath)
-              : this.buildFixPrompt(this.lastReviewIssues, this.lastReviewIssuesPath);
+            const freshPrompt = this.buildFixPrompt(this.lastReviewIssues, this.lastReviewIssuesPath);
             const freshResult = await this.runQueryWithSessionCapture(freshPrompt, options, "fixing");
             workingSessionId = freshResult.sessionId;
 
@@ -1439,12 +1421,11 @@ At the end:
   private async runReviewAgent(
     task: TaskSpec,
     options: Options,
-    existingSessionId: string | null,
-    workerMode: boolean
+    existingSessionId: string | null
   ): Promise<ReviewResult> {
     const reviewPrompt = existingSessionId
-      ? (workerMode ? this.buildReviewContinuationPromptForWorker(task) : this.buildReviewContinuationPrompt(task))
-      : (workerMode ? this.buildReviewPromptForWorker(task) : this.buildReviewPrompt(task));
+      ? this.buildReviewContinuationPrompt(task)
+      : this.buildReviewPrompt(task);
 
     const reviewOptions: Options = {
       ...options,
@@ -1637,13 +1618,12 @@ At the end:
    */
   private async runCodexReview(
     task: TaskSpec,
-    isRerun: boolean,
-    workerMode: boolean
+    isRerun: boolean
   ): Promise<ReviewResult> {
     const reviewNonce = randomUUID();
     const prompt = isRerun
-      ? this.buildCodexReviewContinuationPrompt(task, reviewNonce, workerMode)
-      : this.buildCodexReviewPrompt(task, reviewNonce, workerMode);
+      ? this.buildCodexReviewContinuationPrompt(task, reviewNonce)
+      : this.buildCodexReviewPrompt(task, reviewNonce);
 
     const model = this.cfg.codexModel;
     log("Harness", `Running Codex CLI review (model=${model ?? "default"}, task=${task.id})`);
@@ -1733,10 +1713,8 @@ At the end:
   /**
    * Build the Codex review prompt for initial review.
    */
-  private buildCodexReviewPrompt(task: TaskSpec, reviewNonce: string, workerMode: boolean): string {
-    const coordinationNote = workerMode
-      ? "Do NOT update task_list.json or agent-progress.txt. The worker will finalize after review."
-      : "If PASS, you must update task_list.json and agent-progress.txt as described below.";
+  private buildCodexReviewPrompt(task: TaskSpec, reviewNonce: string): string {
+    const coordinationNote = "If PASS, you must update task_list.json and agent-progress.txt as described below.";
     return `You are a CODE REVIEWER auditing work on task: "${task.id}"
 
 Task description: ${task.description}
@@ -1759,7 +1737,7 @@ REVIEW GUIDELINES:
 
 ${coordinationNote}
 
-${this.buildCodexReviewOutputFormat(task.id, reviewNonce, workerMode)}
+${this.buildCodexReviewOutputFormat(task.id, reviewNonce)}
 
 Begin your audit now.`;
   }
@@ -1767,10 +1745,8 @@ Begin your audit now.`;
   /**
    * Build the Codex review prompt for re-review after fixes.
    */
-  private buildCodexReviewContinuationPrompt(task: TaskSpec, reviewNonce: string, workerMode: boolean): string {
-    const coordinationNote = workerMode
-      ? "Do NOT update task_list.json or agent-progress.txt. The controller handles coordination."
-      : "If PASS, you must update task_list.json and agent-progress.txt as described below.";
+  private buildCodexReviewContinuationPrompt(task: TaskSpec, reviewNonce: string): string {
+    const coordinationNote = "If PASS, you must update task_list.json and agent-progress.txt as described below.";
     return `The working agent claims to have fixed the issues you identified for task "${task.id}".
 
 IMPORTANT: Changes are UNCOMMITTED. Check staged/unstaged changes, not commits.
@@ -1784,16 +1760,11 @@ Same guidelines: trust tests ran, fix minor issues yourself, only re-run if susp
 
 ${coordinationNote}
 
-${this.buildCodexReviewOutputFormat(task.id, reviewNonce, workerMode)}`;
+${this.buildCodexReviewOutputFormat(task.id, reviewNonce)}`;
   }
 
-  private buildCodexReviewOutputFormat(taskId: string, reviewNonce: string, workerMode: boolean): string {
-    const passActions = workerMode
-      ? `If PASS, you MUST:
-1. Do NOT edit task_list.json or agent-progress.txt
-2. Stage ALL changes: git add -A
-3. Do NOT commit; leave changes staged for the worker to finalize`
-      : `If PASS, you MUST:
+  private buildCodexReviewOutputFormat(taskId: string, reviewNonce: string): string {
+    const passActions = `If PASS, you MUST:
 1. Update task_list.json: set "passes": true for "${taskId}"
 2. Append to agent-progress.txt with a concise entry (aim for ~10 lines)
    noting what you reviewed, what you verified/tests run, any issues found, and how
@@ -1874,7 +1845,7 @@ ${passActions}`;
     await this.execGit(["-C", this.workingDir, "remote", "set-url", "origin", authUrl], env);
     try {
       const remoteRef = `refs/remotes/origin/${branchRef}`;
-      // Fetch with an explicit refspec so single-branch clones still track task/* branches.
+      // Fetch with an explicit refspec so single-branch clones track the branch.
       await this.execGit(["-C", this.workingDir, "fetch", "--force", "origin", `+${branchRef}:${remoteRef}`], env);
       try {
         await this.execGit(["-C", this.workingDir, "reset", "--hard"], env);
@@ -2070,262 +2041,6 @@ ${passActions}`;
     }
   }
 
-  private async mergeWorkerTaskIntoBase(task: TaskSpec): Promise<void> {
-    const taskBranch = this.branch;
-    const baseBranch = this.baseBranch;
-    if (taskBranch === baseBranch) return;
-    if (!taskBranch.startsWith("task/")) return;
-
-    const env = this.buildGitEnv();
-    const authUrl = this.getAuthenticatedRepoUrl();
-
-    await this.execGit(["-C", this.workingDir, "remote", "set-url", "origin", authUrl], env);
-    try {
-      const maxAttempts = 3;
-      for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-        log("Harness", `Worker merging ${taskBranch} into ${baseBranch} (attempt ${attempt}/${maxAttempts})...`);
-        const baseRemoteRef = `refs/remotes/origin/${baseBranch}`;
-        const taskRemoteRef = `refs/remotes/origin/${taskBranch}`;
-        await this.execGit(["-C", this.workingDir, "fetch", "--force", "origin", `+${baseBranch}:${baseRemoteRef}`], env);
-        await this.execGit(["-C", this.workingDir, "fetch", "--force", "origin", `+${taskBranch}:${taskRemoteRef}`], env);
-        await this.execGit(["-C", this.workingDir, "checkout", "-B", taskBranch, taskRemoteRef], env);
-
-        try {
-          await this.execGit(["-C", this.workingDir, "rebase", baseRemoteRef], env);
-        } catch (err) {
-          const resolved = await this.resolveRebaseConflicts(taskBranch, baseBranch, err);
-          if (!resolved) {
-            try {
-              await this.execGit(["-C", this.workingDir, "rebase", "--abort"], env);
-            } catch {
-              // ignore
-            }
-            throw err;
-          }
-        }
-
-        await this.pushTaskBranchWithLease(taskBranch, env);
-
-        await this.execGit(["-C", this.workingDir, "checkout", "-B", baseBranch, baseRemoteRef], env);
-        await this.execGit(["-C", this.workingDir, "reset", "--hard", baseRemoteRef], env);
-        await this.execGit(["-C", this.workingDir, "merge", "--ff-only", taskBranch], env);
-
-        try {
-          await this.execGit(["-C", this.workingDir, "push", "origin", baseBranch], env);
-          return;
-        } catch (err: any) {
-          const msg = err?.message ?? "";
-          if (attempt < maxAttempts && msg.includes("non-fast-forward")) {
-            logWarn("Harness", `Push to ${baseBranch} rejected (non-fast-forward); retrying...`);
-            continue;
-          }
-          throw err;
-        }
-      }
-    } finally {
-      await this.execGit(["-C", this.workingDir, "remote", "set-url", "origin", this.repositoryUrl], env);
-    }
-  }
-
-  private async resolveRebaseConflicts(
-    taskBranch: string,
-    baseBranch: string,
-    err: unknown
-  ): Promise<boolean> {
-    const errMsg = err instanceof Error ? err.message : String(err);
-    if (!(await this.isRebaseInProgress())) {
-      logWarn("Harness", `Rebase failed without conflict state: ${errMsg}`);
-      return false;
-    }
-    logWarn(
-      "Harness",
-      `Rebase conflict while merging ${taskBranch} into ${baseBranch}; asking worker to resolve.`
-    );
-
-    const options: Options = {
-      ...this.buildBaseOptions("fixing"),
-      maxTurns: this.cfg.maxWorkingTurns ?? 30,
-      permissionMode: "bypassPermissions",
-      allowDangerouslySkipPermissions: true,
-      ...this.cfg.sdkOptionsOverride,
-    };
-
-    const prompt = this.buildMergeConflictPromptForWorker(taskBranch, baseBranch, errMsg);
-    const env = this.buildGitEnv();
-    const maxAttempts = 3;
-
-    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-      if (!(await this.isRebaseInProgress())) {
-        return true;
-      }
-
-      try {
-        await this.runQuery(prompt, options, "fixing");
-      } catch (resolveErr) {
-        logWarn("Harness", "Merge conflict resolution attempt failed", resolveErr);
-        return false;
-      }
-
-      if (!(await this.isRebaseInProgress())) {
-        return true;
-      }
-
-      try {
-        await this.execGit(["-C", this.workingDir, "rebase", "--continue"], env);
-      } catch (continueErr) {
-        logWarn("Harness", "Failed to continue rebase after conflict resolution", continueErr);
-        if (attempt === maxAttempts) {
-          return false;
-        }
-      }
-    }
-
-    if (await this.isRebaseInProgress()) {
-      logWarn("Harness", "Rebase still in progress after conflict resolution.");
-      return false;
-    }
-
-    return true;
-  }
-
-  private buildMergeConflictPromptForWorker(
-    taskBranch: string,
-    baseBranch: string,
-    errMsg: string
-  ): string {
-    return `
-Git rebase conflict detected while rebasing ${taskBranch} onto origin/${baseBranch}.
-
-Error details:
-${errMsg}
-
-Your job:
-1) Resolve the rebase conflicts in the working tree.
-2) Continue the rebase until it completes.
-3) Run relevant tests if feasible.
-4) Push the updated ${taskBranch} branch (use --force-with-lease if needed).
-
-Rules:
-- Do NOT update task_list.json or agent-progress.txt.
-- Do NOT create new tasks or alter coordination artifacts.
-- Keep changes focused on resolving the conflicts while preserving the task's intent.
-`;
-  }
-
-  private async isRebaseInProgress(): Promise<boolean> {
-    const gitDir = path.join(this.workingDir, ".git");
-    if (await pathExists(path.join(gitDir, "rebase-merge"))) return true;
-    return pathExists(path.join(gitDir, "rebase-apply"));
-  }
-
-  private async applyTaskCompletion(task: TaskSpec): Promise<void> {
-    const taskListPath = this.paths.taskList;
-    const raw = await fs.readFile(taskListPath, "utf8");
-    const data = JSON.parse(raw) as TaskSpec[];
-    const entry = data.find((item) => item.id === task.id);
-    if (!entry) {
-      throw new Error(`Task ${task.id} not found when marking complete.`);
-    }
-    if (entry.passes === true) {
-      return;
-    }
-    entry.passes = true;
-
-    await fs.writeFile(taskListPath, JSON.stringify(data, null, 2) + "\n");
-
-    const progressPath = this.paths.progressLog;
-    const logEntry = `[${new Date().toISOString()}] Completed ${task.id}: ${task.description}\n`;
-    await fs.appendFile(progressPath, logEntry, "utf8");
-  }
-
-  private async finalizeWorkerTask(task: TaskSpec): Promise<void> {
-    const env = this.buildGitEnv();
-    const authUrl = this.getAuthenticatedRepoUrl();
-    const baseBranch = this.baseBranch;
-    const baseRemoteRef = `refs/remotes/origin/${baseBranch}`;
-    const taskRemoteRef = `refs/remotes/origin/${this.branch}`;
-
-    await this.ensureGitIdentity(env);
-
-    await this.execGit(["-C", this.workingDir, "remote", "set-url", "origin", authUrl], env);
-    try {
-      await this.execGit(["-C", this.workingDir, "fetch", "--force", "origin", `+${baseBranch}:${baseRemoteRef}`], env);
-      try {
-        await this.execGit(["-C", this.workingDir, "fetch", "--force", "origin", `+${this.branch}:${taskRemoteRef}`], env);
-      } catch (err: any) {
-        const msg = err?.message ?? "";
-        if (!msg.includes("couldn't find remote ref") && !msg.includes("unknown revision")) {
-          throw err;
-        }
-      }
-
-      const workingStatus = await execFileAsync("git", ["-C", this.workingDir, "status", "--porcelain"], { env });
-      if (workingStatus.stdout.trim()) {
-        await execFileAsync("git", ["-C", this.workingDir, "add", "-A"], { env });
-        await execFileAsync(
-          "git",
-          ["-C", this.workingDir, "commit", "-m", `WIP ${task.id}: prepare finalize`],
-          { env }
-        );
-      }
-
-      try {
-        await this.execGit(["-C", this.workingDir, "rebase", baseRemoteRef], env);
-      } catch (err) {
-        const resolved = await this.resolveRebaseConflicts(this.branch, baseBranch, err);
-        if (!resolved) {
-          try {
-            await this.execGit(["-C", this.workingDir, "rebase", "--abort"], env);
-          } catch {
-            // ignore
-          }
-          throw err;
-        }
-      }
-
-      await this.execGit(["-C", this.workingDir, "reset", "--soft", baseRemoteRef], env);
-
-      await this.applyTaskCompletion(task);
-      await execFileAsync("git", ["-C", this.workingDir, "add", "-A"], { env });
-
-      const status = await execFileAsync("git", ["-C", this.workingDir, "status", "--porcelain"], { env });
-      if (status.stdout.trim()) {
-        await execFileAsync("git", ["-C", this.workingDir, "commit", "-m", `Complete ${task.id}: ${task.description}`], { env });
-      } else {
-        logWarn("Harness", `No changes to commit for ${task.id} after review approval.`);
-      }
-
-      await this.pushTaskBranchWithLease(this.branch, env);
-      await this.mergeWorkerTaskIntoBase(task);
-    } finally {
-      await this.execGit(["-C", this.workingDir, "remote", "set-url", "origin", this.repositoryUrl], env);
-    }
-  }
-
-  private async pushTaskBranchWithLease(branch: string, env: NodeJS.ProcessEnv): Promise<void> {
-    const remoteRef = `refs/remotes/origin/${branch}`;
-    try {
-      await this.execGit(["-C", this.workingDir, "fetch", "--force", "origin", `+${branch}:${remoteRef}`], env);
-    } catch (err) {
-      logWarn("Harness", `Failed to refresh ${remoteRef} before lease push`, err);
-    }
-    let expectedSha: string | null = null;
-    try {
-      expectedSha = (await this.execGit(["-C", this.workingDir, "rev-parse", remoteRef], env)).trim();
-    } catch {
-      expectedSha = null;
-    }
-
-    if (expectedSha) {
-      await this.execGit(
-        ["-C", this.workingDir, "push", `--force-with-lease=refs/heads/${branch}:${expectedSha}`, "origin", branch],
-        env
-      );
-      return;
-    }
-
-    await this.execGit(["-C", this.workingDir, "push", "-u", "origin", branch], env);
-  }
 
   private async ensureGitIdentity(env: NodeJS.ProcessEnv): Promise<void> {
     try {
@@ -2783,62 +2498,6 @@ DO:
   }
 
   /**
-   * Build the working prompt for parallel worker + review mode.
-   * The worker must implement without touching coordination artifacts.
-   */
-  private buildWorkingPromptForWorkerReview(isProjectSetup: boolean, task: TaskSpec): string {
-    const basePrompt = this.buildWorkingPrompt(isProjectSetup, task);
-
-    return `${basePrompt}
-
-═══════════════════════════════════════════════════════════════════════════════
-CRITICAL OVERRIDE - PARALLEL WORKER REVIEW MODE
-═══════════════════════════════════════════════════════════════════════════════
-You are running as a parallel worker with review enabled.
-The controller handles coordination artifacts and final task completion.
-
-DO NOT:
-- Update task_list.json to set "passes": true
-- Write to agent-progress.txt
-- Modify or reformat coordination artifacts
-- Run "git commit" or "git push" (leave changes UNCOMMITTED)
-
-DO:
-- Implement the task fully
-- Run tests and verify they pass
-- Stage your changes with "git add -A"
-- Leave the commit to the review agent
-═══════════════════════════════════════════════════════════════════════════════`;
-  }
-
-  /**
-   * Build the working prompt for parallel worker mode.
-   * The worker must implement and commit code but must NOT update coordination artifacts.
-   */
-  private buildWorkingPromptForWorker(isProjectSetup: boolean, task: TaskSpec): string {
-    const basePrompt = this.buildWorkingPrompt(isProjectSetup, task);
-
-    return `${basePrompt}
-
-═══════════════════════════════════════════════════════════════════════════════
-CRITICAL OVERRIDE - PARALLEL WORKER MODE
-═══════════════════════════════════════════════════════════════════════════════
-You are running as a parallel worker. The worker will finalize coordination
-artifacts after review approval.
-
-DO NOT:
-- Update task_list.json to set "passes": true
-- Write to agent-progress.txt
-- Modify or reformat coordination artifacts
-
-DO:
-- Implement the task fully
-- Run tests and verify they pass
-- Commit your code changes with a focused message
-═══════════════════════════════════════════════════════════════════════════════`;
-  }
-
-  /**
    * Prompt for fixing issues found by the review agent.
    */
   private buildFixPrompt(issues: string[], issuesPath?: string | null): string {
@@ -2876,20 +2535,6 @@ Ensure new task ids do not collide with existing ones; reopen or rename if neede
 After completing your work:
 - Stage your changes with "git add" but DO NOT COMMIT
 - The review agent will verify and commit everything together if it passes
-`;
-  }
-
-  /**
-   * Prompt for fixing issues in parallel worker + review mode.
-   */
-  private buildFixPromptForWorker(issues: string[], issuesPath?: string | null): string {
-    const basePrompt = this.buildFixPrompt(issues, issuesPath);
-    return `${basePrompt}
-
-Additional constraints for parallel worker review mode:
-- Do NOT update task_list.json or agent-progress.txt
-- Do NOT create new coordination tasks in task_list.json; report blockers in your response instead
-- Leave changes staged but UNCOMMITTED for the review agent
 `;
   }
 
@@ -3029,131 +2674,6 @@ Begin your audit now.
   }
 
   /**
-   * Prompt for the review agent in parallel worker mode (no coordination updates).
-   */
-  private buildReviewPromptForWorker(task: TaskSpec): string {
-    const customChecklist = this.cfg.prompts?.reviewChecklist;
-
-    if (customChecklist) {
-      return `
-You are an independent REVIEWER auditing work on task: "${task.id}"
-
-Task description: ${task.description}
-
-You have NO context of how this was done. You must verify independently.
-
-IMPORTANT: The working agent has left changes UNCOMMITTED for you to review.
-You will see staged/unstaged changes, not commits.
-
-YOUR JOB IS TO FIND PROBLEMS. Be skeptical.
-
-${customChecklist}
-
-OUTPUT FORMAT (you MUST use this exact format at the end):
-
-If issues found:
-REVIEW_RESULT: FAIL
-ISSUES:
-- <issue 1 with reference>
-- <issue 2 with reference>
-...
-
-If everything passes:
-REVIEW_RESULT: PASS
-VERIFIED:
-- <what you verified>
-
-Then, if PASS, you MUST do ALL of the following:
-1. Do NOT update task_list.json or agent-progress.txt (worker finalizes after review)
-2. Stage ALL changes: git add -A
-3. Do NOT commit; leave changes staged for the worker to finalize
-
-Begin your review now.
-`;
-    }
-
-    return `
-You are an independent CODE REVIEWER auditing work on task: "${task.id}"
-
-Task description: ${task.description}
-
-You have NO context of how this was implemented. You must verify independently.
-
-IMPORTANT: The working agent has left changes UNCOMMITTED for you to review.
-You will see staged/unstaged changes, not commits.
-
-YOUR JOB IS TO FIND PROBLEMS. Be skeptical. Assume the implementation may be:
-- Incomplete (stubs, placeholders, TODOs left in code)
-- Untested (tests don't actually run, are ignored, or don't verify behavior)
-- Gaming metrics (marking things complete without real verification)
-
-AUDIT CHECKLIST:
-
-1. Check what changed (the working agent left changes uncommitted):
-   - Run: git status
-   - Run: git diff --stat
-   - Run: git diff (for unstaged) and git diff --cached (for staged)
-
-2. Look for cheating patterns:
-   - Run: grep -r "#\\[ignore\\]" on test files (tests that are skipped)
-   - Run: grep -r "TODO\\|FIXME\\|unimplemented\\|todo!" on changed files
-   - Check if tests use "--no-run" (compilation only, no execution)
-
-3. Actually run the tests:
-   - Find and run the relevant test command (cargo test, npm test, pytest, etc.)
-   - Verify tests ACTUALLY EXECUTE (not just compile)
-   - Check the output shows tests running and passing
-
-4. Verify the implementation:
-   - Does the code actually do what the task description says?
-   - Are there stub/placeholder implementations?
-   - Is error handling real or just "// TODO: handle errors"?
-
-5. Check for deferred work:
-   - "Ready to run" but never actually run
-   - "Infrastructure complete" but no actual functionality
-   - Tests that test infrastructure, not behavior
-
-RED FLAGS (automatic fail):
-- Tests marked #[ignore] that should run
-- "cargo test --no-run" used as verification
-- Stub implementations (unimplemented!(), todo!(), pass, ...)
-- TODOs in the implementation code
-- Tests that don't assert anything meaningful
-- "This will be implemented later" comments
-- Abandoning proper libraries for manual implementations without justification
-  (e.g., "had version issues" so switched to manual byte encoding)
-- Using old/deprecated API versions when modern ones should work
-- Redefining task requirements to claim success (e.g., "identical failures count as identical behavior")
-- Rationalizing that broken code meets requirements through creative interpretation
-
-OUTPUT FORMAT (you MUST use this exact format at the end):
-
-If issues found:
-REVIEW_RESULT: FAIL
-ISSUES:
-- <issue 1 with file:line reference>
-- <issue 2 with file:line reference>
-...
-
-If everything passes:
-REVIEW_RESULT: PASS
-VERIFIED:
-- <what you verified>
-- <tests you ran and their output>
-
-Then, if PASS, you MUST do ALL of the following:
-1. Do NOT update task_list.json or agent-progress.txt (worker finalizes after review)
-2. Stage ALL changes: git add -A
-3. Do NOT commit; leave changes staged for the worker to finalize
-
-This ensures the worker can create a single completion commit.
-
-Begin your audit now.
-`;
-  }
-
-  /**
    * Prompt for continuing a review session after fixes.
    */
   private buildReviewContinuationPrompt(task: TaskSpec): string {
@@ -3191,44 +2711,6 @@ If PASS, you MUST do ALL of the following in ONE ATOMIC COMMIT:
 3. Stage ALL changes: git add -A
 4. Commit EVERYTHING together with message:
    "Complete ${task.id}: <brief description>"
-`;
-  }
-
-  /**
-   * Prompt for continuing a review session after fixes (parallel worker mode).
-   */
-  private buildReviewContinuationPromptForWorker(task: TaskSpec): string {
-    return `
-The working agent claims to have fixed the issues you identified.
-
-IMPORTANT: Changes are UNCOMMITTED. Check staged/unstaged changes, not commits.
-
-Re-verify:
-1. Run: git status and git diff to see current changes
-2. Check if each issue you raised has been addressed
-3. Run the tests again to confirm they pass
-4. Look for any NEW issues introduced by the fixes
-
-Be thorough. Don't just trust claims - verify independently.
-
-OUTPUT FORMAT:
-
-If issues remain or new issues found:
-REVIEW_RESULT: FAIL
-ISSUES:
-- <remaining/new issue with file:line reference>
-...
-
-If ALL issues are fixed:
-REVIEW_RESULT: PASS
-VERIFIED:
-- <what you verified>
-
-If PASS, you MUST do ALL of the following in ONE ATOMIC COMMIT:
-1. Do NOT update task_list.json or agent-progress.txt (controller handles it)
-2. Stage ALL changes: git add -A
-3. Commit code changes with message:
-   "Task ${task.id}: <brief description>"
 `;
   }
 
