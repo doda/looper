@@ -38,7 +38,7 @@ Each Looper-managed project contains these files:
 |------|---------|
 | `CLAUDE.md` | Project context and guidelines for agents |
 | `task_list.json` | Structured list of tasks with `passes` flags |
-| `claude-progress.txt` | Running log of work and decisions |
+| `agent-progress.txt` | Running log of work and decisions |
 | `init.sh` | Idempotent script to boot environment and run smoke tests |
 
 ### Session Independence
@@ -126,6 +126,12 @@ interface LongRunningHarnessConfig {
   useProjectSettings?: boolean;  // Load CLAUDE.md (default: true)
   mcpServers?: Options["mcpServers"];
   sdkOptionsOverride?: Partial<Options>;
+
+  // Continuous spec audit
+  continuous?: boolean;          // Run Codex spec audit when tasks complete
+  specAuditMaxAreas?: number;    // Max audit areas (default: 10)
+  specAuditParallelism?: number; // Max parallel reviewers (default: 3)
+  specAuditModel?: string;       // Codex model override for audit
 }
 ```
 
@@ -143,6 +149,9 @@ Options:
   --timeout <secs>         Timeout seconds (default: 3600)
   --repo-url <url>         GitHub repo URL
   --branch <branch>        Git branch (default: main)
+  --continuous             After tasks complete, run a Codex spec audit and continue if new tasks are added
+  --spec-audit-max-areas <n> Max audit areas/reviewers (default: 10)
+  --spec-audit-parallelism <n> Max parallel Codex reviewers (default: 3)
   --claude-oauth-file <f>  Path to Claude Code OAuth credentials JSON
                            (default: ./.claude-code-credentials.json)
 ```
@@ -212,4 +221,3 @@ pnpm lint
 ## License
 
 MIT
-

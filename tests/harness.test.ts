@@ -119,7 +119,7 @@ describe("LongRunningHarness", () => {
     ];
     const { remote, branch } = await createRemoteWithFiles({
       "task_list.json": JSON.stringify(taskList, null, 2),
-      "claude-progress.txt": "log",
+      "agent-progress.txt": "log",
       "init.sh": "#!/usr/bin/env bash\necho ok\n",
     });
 
@@ -143,7 +143,7 @@ describe("LongRunningHarness", () => {
         null,
         2
       ),
-      "claude-progress.txt": "log",
+      "agent-progress.txt": "log",
       "init.sh": "#!/usr/bin/env bash\necho ok\n",
     });
     const workDir = await fs.mkdtemp(path.join(os.tmpdir(), "harness-clone-"));
@@ -165,7 +165,7 @@ describe("LongRunningHarness", () => {
   it("re-runs the planning agent when task_list.json is invalid", async () => {
     const { remote, branch } = await createRemoteWithFiles({
       "task_list.json": "not json",
-      "claude-progress.txt": "log",
+      "agent-progress.txt": "log",
       "init.sh": "#!/usr/bin/env bash\necho ok\n",
     });
 

@@ -21,7 +21,7 @@ Target projects managed by Looper use these files for cross-session coordination
 | File | Purpose |
 |------|---------|
 | `task_list.json` | Structured list of end-to-end tasks with `passes` flags |
-| `claude-progress.txt` | Running log of work, decisions, and onboarding notes |
+| `agent-progress.txt` | Running log of work, decisions, and onboarding notes |
 | `init.sh` | Idempotent script to boot the environment and run smoke tests |
 | `CLAUDE.md` | Project-specific guidelines and context for agents |
 

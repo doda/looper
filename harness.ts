@@ -9,17 +9,13 @@ import {
   type Options,
   type SDKMessage,
 } from "@anthropic-ai/claude-agent-sdk";
+import { logDebug, logError, logInfo, logWarn } from "./logger.js";
 
 const execFileAsync = promisify(execFile);
 
-/** Format timestamp as HH:MM:SS for log output */
-function ts(): string {
-  return new Date().toTimeString().slice(0, 8);
-}
-
 /** Log with timestamp prefix */
 function log(prefix: string, message: string): void {
-  console.log(`[${ts()}] [${prefix}] ${message}`);
+  logInfo(prefix, message);
 }
 
 /**
@@ -85,6 +81,11 @@ export interface LongRunningHarnessConfig {
 
   /** Branch to track on the remote repository (default: main). */
   branch?: string;
+
+  /**
+   * Base branch used when merging task branches (default: branch).
+   */
+  baseBranch?: string;
 
   /** Optional path to a stop-after-session sentinel file. If present, exit after finishing the current session. */
   stopFilePath?: string;
@@ -262,7 +263,7 @@ interface ReviewResult {
  *
  *  - Planning agent: first session only. Analyzes the project spec and creates:
  *      * task_list.json — COMPREHENSIVE list of ALL tasks from the spec with `passes` flags
- *      * claude-progress.txt — log of requirements analysis + onboarding notes
+ *      * agent-progress.txt — log of requirements analysis + onboarding notes
  *      * init.sh — placeholder script (working agent will flesh this out)
  *      * CLAUDE.md — project context for future agents
  *      * initial git repo + commit
@@ -284,6 +285,7 @@ export class LongRunningHarness {
   private readonly paths: ProjectPaths;
   private readonly workingDir: string;
   private readonly branch: string;
+  private readonly baseBranch: string;
   private readonly repositoryUrl: string;
   private readonly gitToken?: string;
   private readonly stopFilePath: string;
@@ -296,6 +298,7 @@ export class LongRunningHarness {
     }
     this.workingDir = cfg.workingDir ?? process.cwd();
     this.branch = cfg.branch ?? "main";
+    this.baseBranch = cfg.baseBranch ?? this.branch;
     this.repositoryUrl = cfg.repositoryUrl;
     this.gitToken = cfg.gitToken ?? process.env.GITHUB_TOKEN;
     this.stopFilePath =
@@ -305,7 +308,7 @@ export class LongRunningHarness {
 
     this.paths = {
       taskList: path.join(this.workingDir, "task_list.json"),
-      progressLog: path.join(this.workingDir, "claude-progress.txt"),
+      progressLog: path.join(this.workingDir, "agent-progress.txt"),
       initScript: path.join(this.workingDir, "init.sh"),
       gitDir: path.join(this.workingDir, ".git"),
     };
@@ -392,16 +395,15 @@ export class LongRunningHarness {
       log("Harness", "═══════════════════════════════════════════════════════════");
       return true;
     } catch (err) {
-      console.error("[Harness] ═══════════════════════════════════════════════════════════");
-      console.error("[Harness] Working session failed with error:");
-      console.error("[Harness]", err instanceof Error ? err.message : err);
-      console.error("[Harness] ═══════════════════════════════════════════════════════════");
+      logError("Harness", "═══════════════════════════════════════════════════════════");
+      logError("Harness", "Working session failed with error", err);
+      logError("Harness", "═══════════════════════════════════════════════════════════");
 
       // Still try to push any commits that were made before the failure
       try {
         await this.pushIfNeeded("working");
       } catch (pushErr) {
-        console.warn("[Harness] Failed to push after error:", pushErr);
+        logWarn("Harness", "Failed to push after error", pushErr);
       }
 
       return false;
@@ -447,15 +449,14 @@ export class LongRunningHarness {
       log("Harness", "═══════════════════════════════════════════════════════════");
       return true;
     } catch (err) {
-      console.error("[Harness] ═══════════════════════════════════════════════════════════");
-      console.error("[Harness] Single-task session failed with error:");
-      console.error("[Harness]", err instanceof Error ? err.message : err);
-      console.error("[Harness] ═══════════════════════════════════════════════════════════");
+      logError("Harness", "═══════════════════════════════════════════════════════════");
+      logError("Harness", "Single-task session failed with error", err);
+      logError("Harness", "═══════════════════════════════════════════════════════════");
 
       try {
         await this.pushIfNeeded("working");
       } catch (pushErr) {
-        console.warn("[Harness] Failed to push after error:", pushErr);
+        logWarn("Harness", "Failed to push after error", pushErr);
       }
 
       return false;
@@ -502,7 +503,7 @@ export class LongRunningHarness {
           workingSessionId = result.sessionId;
 
           if (!result.success) {
-            console.error("[Harness] Working agent failed during implementation");
+            logError("Harness", "Working agent failed during implementation");
             // DO NOT push - revert to clean state
             await this.syncRepoFromRemote();
             return false;
@@ -526,13 +527,13 @@ export class LongRunningHarness {
             workingSessionId = freshResult.sessionId;
 
               if (!freshResult.success) {
-                console.error("[Harness] Working agent failed during fixing (fresh session)");
+                logError("Harness", "Working agent failed during fixing (fresh session)");
                 // DO NOT push - revert to clean state
                 await this.syncRepoFromRemote();
                 return false;
               }
             } else {
-              console.error("[Harness] Working agent failed during fixing");
+              logError("Harness", "Working agent failed during fixing");
               // DO NOT push - revert to clean state
               await this.syncRepoFromRemote();
               return false;
@@ -570,8 +571,8 @@ export class LongRunningHarness {
             const taskList = await this.readTaskList();
             const updatedTask = taskList.find((t) => t.id === task.id);
             if (!updatedTask?.passes) {
-              console.warn(`[Harness] Review said PASS but task ${task.id} not marked as passing in task_list.json`);
-              console.warn("[Harness] Treating as failed review - reviewer must update task_list.json");
+              logWarn("Harness", `Review said PASS but task ${task.id} not marked as passing in task_list.json`);
+              logWarn("Harness", "Treating as failed review - reviewer must update task_list.json");
               this.lastReviewIssues = ["Reviewer approved but did not update task_list.json"];
               continue; // Go to next iteration
             }
@@ -581,7 +582,11 @@ export class LongRunningHarness {
           log("Harness", `✓ Review agent APPROVED task: ${task.id}`);
           log("Harness", "═══════════════════════════════════════════════════════════");
           // Only push after review approval (and task marked passing in controller mode)
-          await this.pushIfNeeded("review");
+          if (workerMode) {
+            await this.finalizeWorkerTask(task);
+          } else {
+            await this.pushIfNeeded("review");
+          }
           return true;
         }
 
@@ -594,9 +599,9 @@ export class LongRunningHarness {
         }
 
         if (iteration === maxIterations) {
-          console.error("[Harness] ═══════════════════════════════════════════════════════════");
-          console.error(`[Harness] ✗ Task ${task.id} failed review after ${maxIterations} iterations`);
-          console.error("[Harness] ═══════════════════════════════════════════════════════════");
+          logError("Harness", "═══════════════════════════════════════════════════════════");
+          logError("Harness", `✗ Task ${task.id} failed review after ${maxIterations} iterations`);
+          logError("Harness", "═══════════════════════════════════════════════════════════");
           // DO NOT push - review failed, don't commit bad code
           // Revert local changes so next session starts clean
           await this.syncRepoFromRemote();
@@ -636,15 +641,15 @@ export class LongRunningHarness {
           }
         }
 
-        console.error("[Harness] ═══════════════════════════════════════════════════════════");
-        console.error(`[Harness] Error during iteration ${iteration}:`, errMsg);
-        console.error("[Harness] ═══════════════════════════════════════════════════════════");
+        logError("Harness", "═══════════════════════════════════════════════════════════");
+        logError("Harness", `Error during iteration ${iteration}: ${errMsg}`);
+        logError("Harness", "═══════════════════════════════════════════════════════════");
 
         // DO NOT push on error - revert to clean state
         try {
           await this.syncRepoFromRemote();
         } catch (syncErr) {
-          console.warn("[Harness] Failed to sync after error:", syncErr);
+          logWarn("Harness", "Failed to sync after error", syncErr);
         }
 
         return false;
@@ -696,8 +701,9 @@ export class LongRunningHarness {
       }
 
       const limitStr = maxSessions > 0 ? `of ${maxSessions}` : "(unlimited)";
-      console.log(
-        `[Harness] ===== Working session #${i + 1} ${limitStr} | ${remaining ?? "?"} tasks remaining =====`
+      logInfo(
+        "Harness",
+        `===== Working session #${i + 1} ${limitStr} | ${remaining ?? "?"} tasks remaining =====`
       );
 
       const success = await this.runWorkingSession();
@@ -707,16 +713,19 @@ export class LongRunningHarness {
         successfulSessions++;
       } else {
         consecutiveFailures++;
-        console.warn(
-          `[Harness] Session failed. Consecutive failures: ${consecutiveFailures}/${maxConsecutiveFailures}`
+        logWarn(
+          "Harness",
+          `Session failed. Consecutive failures: ${consecutiveFailures}/${maxConsecutiveFailures}`
         );
 
         if (consecutiveFailures >= maxConsecutiveFailures) {
-          console.error(
-            `[Harness] Too many consecutive failures (${consecutiveFailures}). Stopping to prevent infinite loop.`
+          logError(
+            "Harness",
+            `Too many consecutive failures (${consecutiveFailures}). Stopping to prevent infinite loop.`
           );
-          console.error(
-            `[Harness] Completed ${successfulSessions} successful sessions before failure.`
+          logError(
+            "Harness",
+            `Completed ${successfulSessions} successful sessions before failure.`
           );
           throw new Error(
             `Harness stopped after ${consecutiveFailures} consecutive session failures`
@@ -1050,7 +1059,7 @@ export class LongRunningHarness {
 
     const env = this.buildGitEnv();
     await this.ensureGitIdentity(env);
-    await execFileAsync("git", ["-C", this.workingDir, "add", "task_list.json", "claude-progress.txt"], { env });
+    await execFileAsync("git", ["-C", this.workingDir, "add", "task_list.json", "agent-progress.txt"], { env });
 
     const status = await execFileAsync("git", ["-C", this.workingDir, "status", "--porcelain"], { env });
     if (status.stdout.trim()) {
@@ -1313,13 +1322,15 @@ Your job:
 - If everything matches the spec, do not add tasks.
 
 STRICT RULES:
-- Do NOT change product code. Only update task_list.json and claude-progress.txt.
+- Do NOT change product code. Only update task_list.json and agent-progress.txt.
 - Be concrete: each task must have clear steps to verify.
 - Avoid duplicates; reuse/reopen existing tasks when appropriate.
 - Ensure any new task id is unique within task_list.json; if it collides, reopen or choose a new id.
 
 At the end:
-- Append a brief entry to claude-progress.txt summarizing the audit.
+- Append a concise entry to agent-progress.txt (aim for ~10 lines, one line per bullet)
+  summarizing what you checked, tests/commands you ran, gaps you found, and how you
+  resolved them (or note unresolved).
 - Commit changes with a message like "Spec audit: <brief summary>".
 `;
   }
@@ -1615,7 +1626,7 @@ At the end:
       log("Harness", `Saved review issues to ${issuesPath}`);
       return issuesPath;
     } catch (err) {
-      console.warn("[Harness] Failed to write review issues file:", err);
+      logWarn("Harness", "Failed to write review issues file", err);
       return null;
     }
   }
@@ -1664,14 +1675,11 @@ At the end:
         // Always show these
         if (trimmed.startsWith("thinking")) return true;
         if (trimmed.startsWith("**")) return true;  // thinking summaries
-        if (trimmed.includes("REVIEW_RESULT")) return true;
+        if (trimmed.includes("CODEX_REVIEW_RESULT") || trimmed.includes("END_CODEX_REVIEW_RESULT")) return false;
+        if (/^\d+\.\s/.test(trimmed)) return false;
         if (trimmed.includes("ISSUES:") || trimmed.includes("VERIFIED:")) return true;
-        if (trimmed.startsWith("- ") && stdout.includes("ISSUES:")) return true;  // issue list items
-        if (trimmed.includes("error") || trimmed.includes("Error")) return true;
-        // Show exec commands but not their output
-        if (trimmed === "exec") return true;
-        if (trimmed.startsWith("/bin/bash")) return true;
-        if (trimmed.includes("succeeded in") || trimmed.includes("failed in")) return true;
+        if (trimmed.startsWith("- ") && (stdout.includes("ISSUES:") || stdout.includes("VERIFIED:"))) return true;
+        if (trimmed.includes("error") || trimmed.includes("Error") || trimmed.includes("failed")) return true;
         // Skip diff lines, file content, etc.
         return false;
       };
@@ -1699,19 +1707,20 @@ At the end:
       proc.on("close", (code) => {
         void (async () => {
           if (code !== 0) {
-            console.error(`[Harness] Codex CLI exited with code ${code}`);
+            logError("Harness", `Codex CLI exited with code ${code}`);
           }
 
           // Parse the review result from codex output
           const { passed, issues } = this.parseReviewResult(stdout + stderr);
           const issuesPath = passed ? null : await this.writeReviewIssues(task, issues, "codex");
+          log("review", `codex: result ${passed ? "PASS" : "FAIL"}${issues.length ? ` (${issues.length} issue(s))` : ""}`);
 
           resolve({ sessionId: null, passed, issues, issuesPath });
         })();
       });
 
       proc.on("error", (err) => {
-        console.error(`[Harness] Codex CLI spawn error: ${err.message}`);
+        logError("Harness", "Codex CLI spawn error", err);
         resolve({
           sessionId: null,
           passed: false,
@@ -1726,8 +1735,8 @@ At the end:
    */
   private buildCodexReviewPrompt(task: TaskSpec, reviewNonce: string, workerMode: boolean): string {
     const coordinationNote = workerMode
-      ? "Do NOT update task_list.json or claude-progress.txt. The controller handles coordination."
-      : "If PASS, you must update task_list.json and claude-progress.txt as described below.";
+      ? "Do NOT update task_list.json or agent-progress.txt. The worker will finalize after review."
+      : "If PASS, you must update task_list.json and agent-progress.txt as described below.";
     return `You are a CODE REVIEWER auditing work on task: "${task.id}"
 
 Task description: ${task.description}
@@ -1760,8 +1769,8 @@ Begin your audit now.`;
    */
   private buildCodexReviewContinuationPrompt(task: TaskSpec, reviewNonce: string, workerMode: boolean): string {
     const coordinationNote = workerMode
-      ? "Do NOT update task_list.json or claude-progress.txt. The controller handles coordination."
-      : "If PASS, you must update task_list.json and claude-progress.txt as described below.";
+      ? "Do NOT update task_list.json or agent-progress.txt. The controller handles coordination."
+      : "If PASS, you must update task_list.json and agent-progress.txt as described below.";
     return `The working agent claims to have fixed the issues you identified for task "${task.id}".
 
 IMPORTANT: Changes are UNCOMMITTED. Check staged/unstaged changes, not commits.
@@ -1781,12 +1790,14 @@ ${this.buildCodexReviewOutputFormat(task.id, reviewNonce, workerMode)}`;
   private buildCodexReviewOutputFormat(taskId: string, reviewNonce: string, workerMode: boolean): string {
     const passActions = workerMode
       ? `If PASS, you MUST:
-1. Do NOT edit task_list.json or claude-progress.txt
+1. Do NOT edit task_list.json or agent-progress.txt
 2. Stage ALL changes: git add -A
-3. Commit code changes with message: "Task ${taskId}: <brief description>"`
+3. Do NOT commit; leave changes staged for the worker to finalize`
       : `If PASS, you MUST:
 1. Update task_list.json: set "passes": true for "${taskId}"
-2. Append to claude-progress.txt with a brief entry
+2. Append to agent-progress.txt with a concise entry (aim for ~10 lines)
+   noting what you reviewed, what you verified/tests run, any issues found, and how
+   they were resolved (or note none).
 3. Stage ALL changes: git add -A
 4. Commit with message: "Complete ${taskId}: <brief description>"`;
     return `OUTPUT FORMAT (MACHINE READABLE ONLY):
@@ -1862,27 +1873,60 @@ ${passActions}`;
     // Update remote URL to authenticated version for fetch
     await this.execGit(["-C", this.workingDir, "remote", "set-url", "origin", authUrl], env);
     try {
-      await this.execGit(["-C", this.workingDir, "fetch", "origin", branchRef], env);
-      await this.execGit(["-C", this.workingDir, "checkout", "-B", branchRef, `origin/${branchRef}`], env);
-      await this.execGit(["-C", this.workingDir, "reset", "--hard", `origin/${branchRef}`], env);
+      const remoteRef = `refs/remotes/origin/${branchRef}`;
+      // Fetch with an explicit refspec so single-branch clones still track task/* branches.
+      await this.execGit(["-C", this.workingDir, "fetch", "--force", "origin", `+${branchRef}:${remoteRef}`], env);
+      try {
+        await this.execGit(["-C", this.workingDir, "reset", "--hard"], env);
+        await this.execGit(["-C", this.workingDir, "clean", "-fd"], env);
+      } catch {
+        // Ignore cleanup failures; checkout will surface real errors.
+      }
+      await this.execGit(["-C", this.workingDir, "checkout", "-B", branchRef, remoteRef], env);
+      await this.execGit(["-C", this.workingDir, "reset", "--hard", remoteRef], env);
       await this.execGit(["-C", this.workingDir, "clean", "-fd"], env);
       log("Harness", `✓ Synced to origin/${branchRef}`);
     } catch (err: any) {
       const msg = err?.message ?? "";
-      // Handle case where remote branch doesn't exist yet (empty repo)
+      const isTaskBranch = branchRef.startsWith("task/");
+      // Treat missing remote branches as fatal to avoid falling back to stale local state.
       if (
         msg.includes("couldn't find remote ref") ||
         msg.includes("unknown revision") ||
         msg.includes("not a commit") ||
         msg.includes("pathspec")
       ) {
-        log("Harness", "Remote branch doesn't exist yet, using local state...");
-      } else {
-        throw err;
+        if (isTaskBranch) {
+          throw new Error(
+            `Remote branch ${branchRef} is missing; refusing to use local state.`
+          );
+        }
+
+        const heads = await this.execGit(["-C", this.workingDir, "ls-remote", "--heads", "origin"], env);
+        if (!heads.trim()) {
+          log("Harness", "Remote repo has no branches; reinitializing local repo...");
+          await this.resetToEmptyRepo(branchRef, env);
+          return;
+        }
+
+        throw new Error(
+          `Remote branch ${branchRef} is missing; repo has other branches. Check --branch.`
+        );
       }
+      throw err;
     }
     // Reset remote URL to non-authenticated version
     await this.execGit(["-C", this.workingDir, "remote", "set-url", "origin", this.repositoryUrl], env);
+  }
+
+  private async resetToEmptyRepo(branchRef: string, env: NodeJS.ProcessEnv): Promise<void> {
+    const entries = await fs.readdir(this.workingDir).catch(() => []);
+    for (const entry of entries) {
+      await fs.rm(path.join(this.workingDir, entry), { recursive: true, force: true });
+    }
+    await execFileAsync("git", ["init"], { cwd: this.workingDir, env });
+    await execFileAsync("git", ["remote", "add", "origin", this.repositoryUrl], { cwd: this.workingDir, env });
+    await execFileAsync("git", ["checkout", "-b", branchRef], { cwd: this.workingDir, env });
   }
 
   /** Build environment for git commands. */
@@ -1914,12 +1958,12 @@ ${passActions}`;
 
   private async execGit(args: string[], env: NodeJS.ProcessEnv): Promise<string> {
     const redactedArgs = args.map(a => a.replace(/x-access-token:[^@]+@/g, "x-access-token:***@"));
-    log("Harness", `git ${redactedArgs.join(" ")}`);
+    logDebug("Harness", `git ${redactedArgs.join(" ")}`);
     try {
       const result = await execFileAsync("git", args, { env });
       const stdout = result.stdout?.toString().trim();
       if (stdout) {
-        log("Harness", `git output: ${stdout.substring(0, 200)}${stdout.length > 200 ? "..." : ""}`);
+        logDebug("Harness", `git output: ${stdout.substring(0, 200)}${stdout.length > 200 ? "..." : ""}`);
       }
       return stdout ?? "";
     } catch (err: any) {
@@ -1930,8 +1974,8 @@ ${passActions}`;
         "unknown error";
       // Redact any tokens from error messages
       const redactedStderr = stderr.replace(/x-access-token:[^@]+@/g, "x-access-token:***@");
-      console.error(`[Harness] git error: ${redactedStderr.substring(0, 500)}`);
-      throw new Error(`[Harness] Git command failed (${redactedArgs.join(" ")}): ${redactedStderr}`);
+      logError("Harness", `git error: ${redactedStderr.substring(0, 500)}`);
+      throw new Error(`Git command failed (${redactedArgs.join(" ")}): ${redactedStderr}`);
     }
   }
 
@@ -1941,7 +1985,7 @@ ${passActions}`;
     const needsToken = this.requiresGithubToken(this.repositoryUrl);
     if (needsToken && !this.gitToken) {
       throw new Error(
-        `[Harness] GITHUB_TOKEN is required to push changes to ${this.repositoryUrl}. Provide a token with repo scope before running ${phase}.`
+        `GITHUB_TOKEN is required to push changes to ${this.repositoryUrl}. Provide a token with repo scope before running ${phase}.`
       );
     }
 
@@ -1952,13 +1996,14 @@ ${passActions}`;
       const status = await execFileAsync("git", ["-C", this.workingDir, "status", "--porcelain"], { env });
       const uncommitted = status.stdout.trim();
       if (uncommitted) {
-        console.warn(`[Harness] Found uncommitted changes, auto-committing...`);
+        logWarn("Harness", "Found uncommitted changes, auto-committing...");
+        await this.ensureGitIdentity(env);
         await execFileAsync("git", ["-C", this.workingDir, "add", "-A"], { env });
         await execFileAsync("git", ["-C", this.workingDir, "commit", "-m", `Auto-commit uncommitted changes (${phase})`], { env });
         log("Harness", `Auto-committed uncommitted changes`);
       }
     } catch (err) {
-      console.warn(`[Harness] Failed to check/commit uncommitted changes:`, err instanceof Error ? err.message : err);
+      logWarn("Harness", "Failed to check/commit uncommitted changes", err);
     }
 
     // Check if there are any commits at all
@@ -2002,24 +2047,284 @@ ${passActions}`;
     const authUrl = this.getAuthenticatedRepoUrl();
     log("Harness", `Pushing to origin/${this.branch}...`);
     try {
+      await this.execGit(["-C", this.workingDir, "remote", "set-url", "origin", authUrl], env);
       // First, try to pull with rebase in case remote has new commits
       try {
         log("Harness", `Attempting pull --rebase first...`);
-        await this.execGit(["-C", this.workingDir, "pull", "--rebase", authUrl, this.branch], env);
+        await this.execGit(["-C", this.workingDir, "pull", "--rebase", "origin", this.branch], env);
       } catch (pullErr) {
         // Pull may fail if remote branch doesn't exist yet, that's OK
         log("Harness", `Pull --rebase skipped or failed (may be expected): ${pullErr instanceof Error ? pullErr.message : pullErr}`);
       }
       // Use -u to set upstream if this is the first push
       log("Harness", `Executing push...`);
-      await this.execGit(["-C", this.workingDir, "push", "-u", authUrl, this.branch], env);
+      await this.execGit(["-C", this.workingDir, "push", "-u", "origin", this.branch], env);
       log("Harness", `✓ Successfully pushed ${unpushedCommits.length} commit(s) to origin/${this.branch} (${phase}).`);
     } catch (err) {
-      console.error(`[Harness] ✗ Failed to push to origin/${this.branch}:`, err);
+      logError("Harness", `✗ Failed to push to origin/${this.branch}`, err);
       throw new Error(
-        `[Harness] Failed to push to origin/${this.branch}. Ensure GITHUB_TOKEN has repo push permissions.`
+        `Failed to push to origin/${this.branch}. Ensure GITHUB_TOKEN has repo push permissions.`
       );
+    } finally {
+      await this.execGit(["-C", this.workingDir, "remote", "set-url", "origin", this.repositoryUrl], env);
     }
+  }
+
+  private async mergeWorkerTaskIntoBase(task: TaskSpec): Promise<void> {
+    const taskBranch = this.branch;
+    const baseBranch = this.baseBranch;
+    if (taskBranch === baseBranch) return;
+    if (!taskBranch.startsWith("task/")) return;
+
+    const env = this.buildGitEnv();
+    const authUrl = this.getAuthenticatedRepoUrl();
+
+    await this.execGit(["-C", this.workingDir, "remote", "set-url", "origin", authUrl], env);
+    try {
+      const maxAttempts = 3;
+      for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        log("Harness", `Worker merging ${taskBranch} into ${baseBranch} (attempt ${attempt}/${maxAttempts})...`);
+        const baseRemoteRef = `refs/remotes/origin/${baseBranch}`;
+        const taskRemoteRef = `refs/remotes/origin/${taskBranch}`;
+        await this.execGit(["-C", this.workingDir, "fetch", "--force", "origin", `+${baseBranch}:${baseRemoteRef}`], env);
+        await this.execGit(["-C", this.workingDir, "fetch", "--force", "origin", `+${taskBranch}:${taskRemoteRef}`], env);
+        await this.execGit(["-C", this.workingDir, "checkout", "-B", taskBranch, taskRemoteRef], env);
+
+        try {
+          await this.execGit(["-C", this.workingDir, "rebase", baseRemoteRef], env);
+        } catch (err) {
+          const resolved = await this.resolveRebaseConflicts(taskBranch, baseBranch, err);
+          if (!resolved) {
+            try {
+              await this.execGit(["-C", this.workingDir, "rebase", "--abort"], env);
+            } catch {
+              // ignore
+            }
+            throw err;
+          }
+        }
+
+        await this.pushTaskBranchWithLease(taskBranch, env);
+
+        await this.execGit(["-C", this.workingDir, "checkout", "-B", baseBranch, baseRemoteRef], env);
+        await this.execGit(["-C", this.workingDir, "reset", "--hard", baseRemoteRef], env);
+        await this.execGit(["-C", this.workingDir, "merge", "--ff-only", taskBranch], env);
+
+        try {
+          await this.execGit(["-C", this.workingDir, "push", "origin", baseBranch], env);
+          return;
+        } catch (err: any) {
+          const msg = err?.message ?? "";
+          if (attempt < maxAttempts && msg.includes("non-fast-forward")) {
+            logWarn("Harness", `Push to ${baseBranch} rejected (non-fast-forward); retrying...`);
+            continue;
+          }
+          throw err;
+        }
+      }
+    } finally {
+      await this.execGit(["-C", this.workingDir, "remote", "set-url", "origin", this.repositoryUrl], env);
+    }
+  }
+
+  private async resolveRebaseConflicts(
+    taskBranch: string,
+    baseBranch: string,
+    err: unknown
+  ): Promise<boolean> {
+    const errMsg = err instanceof Error ? err.message : String(err);
+    if (!(await this.isRebaseInProgress())) {
+      logWarn("Harness", `Rebase failed without conflict state: ${errMsg}`);
+      return false;
+    }
+    logWarn(
+      "Harness",
+      `Rebase conflict while merging ${taskBranch} into ${baseBranch}; asking worker to resolve.`
+    );
+
+    const options: Options = {
+      ...this.buildBaseOptions("fixing"),
+      maxTurns: this.cfg.maxWorkingTurns ?? 30,
+      permissionMode: "bypassPermissions",
+      allowDangerouslySkipPermissions: true,
+      ...this.cfg.sdkOptionsOverride,
+    };
+
+    const prompt = this.buildMergeConflictPromptForWorker(taskBranch, baseBranch, errMsg);
+    const env = this.buildGitEnv();
+    const maxAttempts = 3;
+
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      if (!(await this.isRebaseInProgress())) {
+        return true;
+      }
+
+      try {
+        await this.runQuery(prompt, options, "fixing");
+      } catch (resolveErr) {
+        logWarn("Harness", "Merge conflict resolution attempt failed", resolveErr);
+        return false;
+      }
+
+      if (!(await this.isRebaseInProgress())) {
+        return true;
+      }
+
+      try {
+        await this.execGit(["-C", this.workingDir, "rebase", "--continue"], env);
+      } catch (continueErr) {
+        logWarn("Harness", "Failed to continue rebase after conflict resolution", continueErr);
+        if (attempt === maxAttempts) {
+          return false;
+        }
+      }
+    }
+
+    if (await this.isRebaseInProgress()) {
+      logWarn("Harness", "Rebase still in progress after conflict resolution.");
+      return false;
+    }
+
+    return true;
+  }
+
+  private buildMergeConflictPromptForWorker(
+    taskBranch: string,
+    baseBranch: string,
+    errMsg: string
+  ): string {
+    return `
+Git rebase conflict detected while rebasing ${taskBranch} onto origin/${baseBranch}.
+
+Error details:
+${errMsg}
+
+Your job:
+1) Resolve the rebase conflicts in the working tree.
+2) Continue the rebase until it completes.
+3) Run relevant tests if feasible.
+4) Push the updated ${taskBranch} branch (use --force-with-lease if needed).
+
+Rules:
+- Do NOT update task_list.json or agent-progress.txt.
+- Do NOT create new tasks or alter coordination artifacts.
+- Keep changes focused on resolving the conflicts while preserving the task's intent.
+`;
+  }
+
+  private async isRebaseInProgress(): Promise<boolean> {
+    const gitDir = path.join(this.workingDir, ".git");
+    if (await pathExists(path.join(gitDir, "rebase-merge"))) return true;
+    return pathExists(path.join(gitDir, "rebase-apply"));
+  }
+
+  private async applyTaskCompletion(task: TaskSpec): Promise<void> {
+    const taskListPath = this.paths.taskList;
+    const raw = await fs.readFile(taskListPath, "utf8");
+    const data = JSON.parse(raw) as TaskSpec[];
+    const entry = data.find((item) => item.id === task.id);
+    if (!entry) {
+      throw new Error(`Task ${task.id} not found when marking complete.`);
+    }
+    if (entry.passes === true) {
+      return;
+    }
+    entry.passes = true;
+
+    await fs.writeFile(taskListPath, JSON.stringify(data, null, 2) + "\n");
+
+    const progressPath = this.paths.progressLog;
+    const logEntry = `[${new Date().toISOString()}] Completed ${task.id}: ${task.description}\n`;
+    await fs.appendFile(progressPath, logEntry, "utf8");
+  }
+
+  private async finalizeWorkerTask(task: TaskSpec): Promise<void> {
+    const env = this.buildGitEnv();
+    const authUrl = this.getAuthenticatedRepoUrl();
+    const baseBranch = this.baseBranch;
+    const baseRemoteRef = `refs/remotes/origin/${baseBranch}`;
+    const taskRemoteRef = `refs/remotes/origin/${this.branch}`;
+
+    await this.ensureGitIdentity(env);
+
+    await this.execGit(["-C", this.workingDir, "remote", "set-url", "origin", authUrl], env);
+    try {
+      await this.execGit(["-C", this.workingDir, "fetch", "--force", "origin", `+${baseBranch}:${baseRemoteRef}`], env);
+      try {
+        await this.execGit(["-C", this.workingDir, "fetch", "--force", "origin", `+${this.branch}:${taskRemoteRef}`], env);
+      } catch (err: any) {
+        const msg = err?.message ?? "";
+        if (!msg.includes("couldn't find remote ref") && !msg.includes("unknown revision")) {
+          throw err;
+        }
+      }
+
+      const workingStatus = await execFileAsync("git", ["-C", this.workingDir, "status", "--porcelain"], { env });
+      if (workingStatus.stdout.trim()) {
+        await execFileAsync("git", ["-C", this.workingDir, "add", "-A"], { env });
+        await execFileAsync(
+          "git",
+          ["-C", this.workingDir, "commit", "-m", `WIP ${task.id}: prepare finalize`],
+          { env }
+        );
+      }
+
+      try {
+        await this.execGit(["-C", this.workingDir, "rebase", baseRemoteRef], env);
+      } catch (err) {
+        const resolved = await this.resolveRebaseConflicts(this.branch, baseBranch, err);
+        if (!resolved) {
+          try {
+            await this.execGit(["-C", this.workingDir, "rebase", "--abort"], env);
+          } catch {
+            // ignore
+          }
+          throw err;
+        }
+      }
+
+      await this.execGit(["-C", this.workingDir, "reset", "--soft", baseRemoteRef], env);
+
+      await this.applyTaskCompletion(task);
+      await execFileAsync("git", ["-C", this.workingDir, "add", "-A"], { env });
+
+      const status = await execFileAsync("git", ["-C", this.workingDir, "status", "--porcelain"], { env });
+      if (status.stdout.trim()) {
+        await execFileAsync("git", ["-C", this.workingDir, "commit", "-m", `Complete ${task.id}: ${task.description}`], { env });
+      } else {
+        logWarn("Harness", `No changes to commit for ${task.id} after review approval.`);
+      }
+
+      await this.pushTaskBranchWithLease(this.branch, env);
+      await this.mergeWorkerTaskIntoBase(task);
+    } finally {
+      await this.execGit(["-C", this.workingDir, "remote", "set-url", "origin", this.repositoryUrl], env);
+    }
+  }
+
+  private async pushTaskBranchWithLease(branch: string, env: NodeJS.ProcessEnv): Promise<void> {
+    const remoteRef = `refs/remotes/origin/${branch}`;
+    try {
+      await this.execGit(["-C", this.workingDir, "fetch", "--force", "origin", `+${branch}:${remoteRef}`], env);
+    } catch (err) {
+      logWarn("Harness", `Failed to refresh ${remoteRef} before lease push`, err);
+    }
+    let expectedSha: string | null = null;
+    try {
+      expectedSha = (await this.execGit(["-C", this.workingDir, "rev-parse", remoteRef], env)).trim();
+    } catch {
+      expectedSha = null;
+    }
+
+    if (expectedSha) {
+      await this.execGit(
+        ["-C", this.workingDir, "push", `--force-with-lease=refs/heads/${branch}:${expectedSha}`, "origin", branch],
+        env
+      );
+      return;
+    }
+
+    await this.execGit(["-C", this.workingDir, "push", "-u", "origin", branch], env);
   }
 
   private async ensureGitIdentity(env: NodeJS.ProcessEnv): Promise<void> {
@@ -2154,7 +2459,7 @@ CRITICAL WARNING - FILE SIZE LIMITS:
 Your PRIMARY job is to create a COMPREHENSIVE task list that covers EVERYTHING
 in the project spec. Do NOT implement any tasks or scaffold the project.
 Project setup is the FIRST task in the list for a working agent to implement.
-Create coordination artifacts (task_list.json, claude-progress.txt, init.sh,
+Create coordination artifacts (task_list.json, agent-progress.txt, init.sh,
 CLAUDE.md) for future working agents. Work on branch ${this.branch}.
 ${envInfo}`;
     }
@@ -2170,7 +2475,7 @@ ${envInfo}`;
     if (phase === "audit") {
       return `You are a SPEC AUDITOR for a Looper-managed project.
 Your job is to check whether the implementation matches the project spec.
-Only update coordination artifacts (task_list.json, claude-progress.txt).
+Only update coordination artifacts (task_list.json, agent-progress.txt).
 Do NOT change product code. Work on branch ${this.branch}.
 ${envInfo}`;
     }
@@ -2238,7 +2543,7 @@ In this session you must:
    - Include both happy paths AND error cases where the spec implies them.
    - Order tasks roughly by dependency (setup first, then core tasks, then polish).
 
-3) Create claude-progress.txt at the repo root
+3) Create agent-progress.txt at the repo root
    - Start a running log for future agents.
    - Keep it concise (under 20 lines). Include:
        - Brief summary of project requirements.
@@ -2310,7 +2615,7 @@ You MUST work on this specific task. Do NOT choose a different task.
 IMPORTANT: You are working on the "project-setup" task.
 
 This means the project has NOT been scaffolded yet. Your job is to:
-  - Read CLAUDE.md and claude-progress.txt for recommended stack/approach.
+  - Read CLAUDE.md and agent-progress.txt for recommended stack/approach.
   - Choose and implement a sensible tech stack for the project requirements.
   - Create the project structure (package.json, dependencies, config files, etc.).
   - Set up a basic working skeleton that future tasks can build upon.
@@ -2342,11 +2647,11 @@ Key coordination artifacts (ALL at repo root):
 - CLAUDE.md — project context and guidelines (read this first).
 - SPEC.md — the FULL original project specification (reference for detailed requirements).
 - task_list.json — list of end-to-end tasks with a "passes" flag.
-- claude-progress.txt — log of previous work and instructions.
+- agent-progress.txt — log of previous work and instructions.
 - init.sh — script to start the environment and run smoke tests.
 - git log — history of previous changes.
 
-NOTE: Coordination artifacts (task_list.json, claude-progress.txt, init.sh) go at repo root.
+NOTE: Coordination artifacts (task_list.json, agent-progress.txt, init.sh) go at repo root.
 Project source code goes in appropriate subdirectories (src/, backend/, frontend/, etc.).
 
 Your job in this session is to:
@@ -2361,7 +2666,7 @@ Follow this checklist strictly:
 1) Get your bearings
    - Run "pwd" to confirm the working directory.
    - Ensure the repo is on branch ${this.branch} and synced to origin/${this.branch}.
-   - Read claude-progress.txt.
+   - Read agent-progress.txt.
    - Inspect recent git history (e.g. "git log --oneline -20").
    - Open task_list.json.
 
@@ -2405,13 +2710,16 @@ ${isProjectSetup ? "7" : "8"}) Update coordination artifacts ONLY when the task 
        - Do NOT edit "category", "description", or "steps" unless you are fixing an objectively incorrect test (e.g., the product requirements changed).
        - It is unacceptable to delete or weaken tests just to make a task appear passing.
        - Do not remove or rename other tasks.
-   - In claude-progress.txt:
-       - Append a BRIEF entry (aim for 3-5 lines) noting:
-           - Which task you worked on (by id).
-           - Key files changed.
-           - How you verified it works.
-           - Any blockers or TODOs for future agents.
-       - Be concise—future agents skim this log, they don't read essays.
+   - In agent-progress.txt:
+       - Append a concise entry (aim for ~10 lines) noting:
+           - Task id + outcome (pass/fail).
+           - 1-2 lines on what you implemented or changed.
+           - Key files changed (paths).
+           - Verification/tests run (commands + results).
+           - Challenges encountered (1-3 lines).
+           - How you resolved each challenge (1-3 lines) or note unresolved.
+           - Follow-ups/blockers for future agents.
+       - Use one bullet per line; be concrete so future agents can skim fast.
 
 ${isProjectSetup ? "7" : "8"}) Commit your work
    - Run tests and ./init.sh to verify everything works (must pass fully).
@@ -2462,7 +2770,7 @@ You are in REVIEW MODE. A separate review agent will audit your work.
 
 DO NOT:
 - Update task_list.json to set "passes": true
-- Write to claude-progress.txt
+- Write to agent-progress.txt
 - Mark the task as complete in any way
 - Run "git commit" - leave your changes UNCOMMITTED
 
@@ -2491,7 +2799,7 @@ The controller handles coordination artifacts and final task completion.
 
 DO NOT:
 - Update task_list.json to set "passes": true
-- Write to claude-progress.txt
+- Write to agent-progress.txt
 - Modify or reformat coordination artifacts
 - Run "git commit" or "git push" (leave changes UNCOMMITTED)
 
@@ -2515,12 +2823,12 @@ DO:
 ═══════════════════════════════════════════════════════════════════════════════
 CRITICAL OVERRIDE - PARALLEL WORKER MODE
 ═══════════════════════════════════════════════════════════════════════════════
-You are running as a parallel worker. The controller will update coordination
-artifacts and mark tasks complete.
+You are running as a parallel worker. The worker will finalize coordination
+artifacts after review approval.
 
 DO NOT:
 - Update task_list.json to set "passes": true
-- Write to claude-progress.txt
+- Write to agent-progress.txt
 - Modify or reformat coordination artifacts
 
 DO:
@@ -2579,7 +2887,7 @@ After completing your work:
     return `${basePrompt}
 
 Additional constraints for parallel worker review mode:
-- Do NOT update task_list.json or claude-progress.txt
+- Do NOT update task_list.json or agent-progress.txt
 - Do NOT create new coordination tasks in task_list.json; report blockers in your response instead
 - Leave changes staged but UNCOMMITTED for the review agent
 `;
@@ -2623,7 +2931,9 @@ VERIFIED:
 
 Then, if PASS, you MUST do ALL of the following in ONE ATOMIC COMMIT:
 1. Update task_list.json: set "passes": true for "${task.id}"
-2. Append to claude-progress.txt with a brief entry noting the task was reviewed and approved
+2. Append to agent-progress.txt with a concise entry (aim for ~10 lines)
+   noting what you reviewed, what you verified/tests run, any issues found, and how
+   they were resolved (or note none).
 3. Stage ALL changes: git add -A
 4. Commit EVERYTHING together with message:
    "Complete ${task.id}: <brief description>"
@@ -2705,7 +3015,9 @@ VERIFIED:
 
 Then, if PASS, you MUST do ALL of the following in ONE ATOMIC COMMIT:
 1. Update task_list.json: set "passes": true for "${task.id}"
-2. Append to claude-progress.txt with a brief entry noting the task was reviewed and approved
+2. Append to agent-progress.txt with a concise entry (aim for ~10 lines)
+   noting what you reviewed, what you verified/tests run, any issues found, and how
+   they were resolved (or note none).
 3. Stage ALL changes: git add -A
 4. Commit EVERYTHING together (implementation + task updates) with message:
    "Complete ${task.id}: <brief description of what was implemented>"
@@ -2751,11 +3063,10 @@ REVIEW_RESULT: PASS
 VERIFIED:
 - <what you verified>
 
-Then, if PASS, you MUST do ALL of the following in ONE ATOMIC COMMIT:
-1. Do NOT update task_list.json or claude-progress.txt (controller handles it)
+Then, if PASS, you MUST do ALL of the following:
+1. Do NOT update task_list.json or agent-progress.txt (worker finalizes after review)
 2. Stage ALL changes: git add -A
-3. Commit code changes with message:
-   "Task ${task.id}: <brief description>"
+3. Do NOT commit; leave changes staged for the worker to finalize
 
 Begin your review now.
 `;
@@ -2831,13 +3142,12 @@ VERIFIED:
 - <what you verified>
 - <tests you ran and their output>
 
-Then, if PASS, you MUST do ALL of the following in ONE ATOMIC COMMIT:
-1. Do NOT update task_list.json or claude-progress.txt (controller handles it)
+Then, if PASS, you MUST do ALL of the following:
+1. Do NOT update task_list.json or agent-progress.txt (worker finalizes after review)
 2. Stage ALL changes: git add -A
-3. Commit code changes with message:
-   "Task ${task.id}: <brief description of what was implemented>"
+3. Do NOT commit; leave changes staged for the worker to finalize
 
-This ensures the implementation is committed for the controller to merge.
+This ensures the worker can create a single completion commit.
 
 Begin your audit now.
 `;
@@ -2875,7 +3185,9 @@ VERIFIED:
 
 If PASS, you MUST do ALL of the following in ONE ATOMIC COMMIT:
 1. Update task_list.json: set "passes": true for "${task.id}"
-2. Append to claude-progress.txt with a brief entry
+2. Append to agent-progress.txt with a concise entry (aim for ~10 lines)
+   noting what you reviewed, what you verified/tests run, any issues found, and how
+   they were resolved (or note none).
 3. Stage ALL changes: git add -A
 4. Commit EVERYTHING together with message:
    "Complete ${task.id}: <brief description>"
@@ -2913,7 +3225,7 @@ VERIFIED:
 - <what you verified>
 
 If PASS, you MUST do ALL of the following in ONE ATOMIC COMMIT:
-1. Do NOT update task_list.json or claude-progress.txt (controller handles it)
+1. Do NOT update task_list.json or agent-progress.txt (controller handles it)
 2. Stage ALL changes: git add -A
 3. Commit code changes with message:
    "Task ${task.id}: <brief description>"
@@ -2925,7 +3237,7 @@ If PASS, you MUST do ALL of the following in ONE ATOMIC COMMIT:
       await this.readTaskList();
       return true;
     } catch (err) {
-      console.warn("[Harness] Invalid task_list.json detected.", err);
+      logWarn("Harness", "Invalid task_list.json detected.", err);
       return false;
     }
   }
@@ -3019,8 +3331,9 @@ If PASS, you MUST do ALL of the following in ONE ATOMIC COMMIT:
       return normalized;
     }
 
-    console.warn(
-      `[Harness] Duplicate task ids detected; using last occurrence for: ${duplicates.join(", ")}`
+    logWarn(
+      "Harness",
+      `Duplicate task ids detected; using last occurrence for: ${duplicates.join(", ")}`
     );
 
     const seen = new Set<string>();
@@ -3056,8 +3369,9 @@ If PASS, you MUST do ALL of the following in ONE ATOMIC COMMIT:
       }
       return remaining;
     } catch (err) {
-      console.warn(
-        "[Harness] Invalid task_list.json; treating remaining tasks as unknown.",
+      logWarn(
+        "Harness",
+        "Invalid task_list.json; treating remaining tasks as unknown.",
         err
       );
       return null;
@@ -3109,7 +3423,11 @@ If PASS, you MUST do ALL of the following in ONE ATOMIC COMMIT:
           } else if (block?.type === "tool_use") {
             // Log tool name and a brief summary of input
             const inputSummary = this.summarizeToolInput(block.name, block.input);
-            log(phase, `tool: ${block.name}${inputSummary ? ` (${inputSummary})` : ""}`);
+            if (inputSummary) {
+              log(phase, `tool: ${inputSummary}`);
+            } else {
+              log(phase, `tool: ${block.name}`);
+            }
           }
         }
         break;
@@ -3119,8 +3437,9 @@ If PASS, you MUST do ALL of the following in ONE ATOMIC COMMIT:
         if (msg.subtype === "success") {
           log(phase, `✓ result: turns=${msg.num_turns}, duration=${msg.duration_ms}ms, cost=$${msg.total_cost_usd.toFixed(4)}`);
         } else {
-          console.warn(
-            `[${ts()}] [${phase}] ✗ result (${msg.subtype}): turns=${msg.num_turns}, errors=${msg.errors?.join("; ")}`
+          logWarn(
+            phase,
+            `✗ result (${msg.subtype}): turns=${msg.num_turns}, errors=${msg.errors?.join("; ")}`
           );
         }
         break;
@@ -3143,16 +3462,21 @@ If PASS, you MUST do ALL of the following in ONE ATOMIC COMMIT:
     try {
       switch (toolName) {
         case "Bash":
-          return input.command?.substring(0, 60) + (input.command?.length > 60 ? "..." : "");
+          if (!input.command) return "Bash";
+          return `Bash -> ${input.command.substring(0, 80)}${input.command.length > 80 ? "..." : ""}`;
         case "Read":
         case "Write":
-          return input.file_path?.split("/").slice(-2).join("/");
+          return input.file_path ? `${toolName} -> ${input.file_path.split("/").slice(-2).join("/")}` : toolName;
         case "Edit":
-          return input.file_path?.split("/").slice(-2).join("/");
+          return input.file_path ? `Edit -> ${input.file_path.split("/").slice(-2).join("/")}` : "Edit";
+        case "TodoWrite": {
+          const count = Array.isArray(input.todos) ? input.todos.length : undefined;
+          return count !== undefined ? `TodoWrite -> updated ${count} item(s)` : "TodoWrite -> updated plan";
+        }
         case "Glob":
-          return input.pattern;
+          return input.pattern ? `Glob -> ${input.pattern}` : "Glob";
         case "Grep":
-          return input.pattern?.substring(0, 40);
+          return input.pattern ? `Grep -> ${input.pattern.substring(0, 60)}` : "Grep";
         default:
           return "";
       }
