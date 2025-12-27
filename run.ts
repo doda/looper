@@ -13,7 +13,12 @@
  *   --cpu <cores>          CPU cores (default: 4.0)
  *   --memory <mb>          Memory in MB (default: 16384)
  *   --timeout <secs>       Timeout in seconds (default: 3600)
- *   --model <model>        Claude model: sonnet, opus (default: sonnet)
+ *   --parallel <n>         Parallel worker sandboxes (default: 1)
+ *   --clean-task-branches  Delete all remote task/* branches before starting
+ *   --continuous           After tasks complete, run a Codex spec audit and continue if new tasks are added
+ *   --spec-audit-max-areas <n> Max audit areas/reviewers (default: 10)
+ *   --spec-audit-parallelism <n> Max parallel Codex reviewers (default: 3)
+ *   --model <model>        Claude model: opus, sonnet (default: opus)
  *   --claude-oauth-file <f> Path to Claude Code OAuth credentials JSON (default: ./.claude-code-credentials.json)
  *
  * Environment:
@@ -28,7 +33,8 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { LongRunningHarness } from "./harness.js";
+import { LongRunningHarness, type TaskSpec, type LongRunningHarnessConfig } from "./harness.js";
+import { getReadyTasks } from "./scheduler.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -50,11 +56,49 @@ interface Config {
   reviewAgent?: "claude" | "codex";
   codexModel?: string;
   codexCredentials?: string;
+  parallelWorkers?: number;
+  cleanTaskBranches?: boolean;
+  prompts?: LongRunningHarnessConfig["prompts"];
+  continuous?: boolean;
+  specAuditMaxAreas?: number;
+  specAuditParallelism?: number;
+}
+
+interface WorkerResult {
+  taskId: string;
+  branch: string;
+  exitCode: number;
+}
+
+interface WorkerState {
+  task: TaskSpec;
+  branch: string;
+  sandbox: Sandbox;
+  slot: number;
+  promise: Promise<WorkerResult>;
+}
+
+interface ParallelControllerConfig {
+  projectName: string;
+  projectSpec: string;
+  repoUrl: string;
+  branch: string;
+  model: string;
+  workingDir: string;
+  parallelWorkers: number;
+  stopFilePath: string;
+  cleanTaskBranches: boolean;
+  prompts?: LongRunningHarnessConfig["prompts"];
+  continuous?: boolean;
+  specAuditMaxAreas?: number;
+  specAuditParallelism?: number;
 }
 
 // Detect if running inside Modal sandbox
 const IN_MODAL = process.env.__LOOPER_IN_MODAL === "1";
 const STOP_FILE_PATH = "/harness/.looper-stop-after-session";
+const STALE_BRANCH_MS = 24 * 60 * 60 * 1000;
+const HARNESS_STATIC_FILES = new Set(["package.json", "tsconfig.json"]);
 
 // Self-renewal: spawn successor sandbox before 24h timeout
 const RENEWAL_AFTER_MS = 23 * 60 * 60 * 1000; // 23 hours
@@ -183,6 +227,7 @@ async function runInModal() {
   console.log(`[Looper] Repo: ${config.repoUrl} (branch ${config.branch})`);
   console.log(`[Looper] Model: ${config.model}`);
   console.log(`[Looper] Sessions: ${config.sessions || "unlimited"}`);
+  console.log(`[Looper] Parallel workers: ${config.parallelWorkers ?? 1}`);
   console.log(`[Looper] Modal credentials: ${process.env.MODAL_TOKEN_ID ? "available" : "not set"}`);
 
   const client = new ModalClient();
@@ -209,6 +254,8 @@ async function runInModal() {
         }
       }
       console.log(`[Looper] Existing sandboxes terminated.`);
+    } else if ((config.parallelWorkers ?? 1) > 1) {
+      console.warn(`[Looper] Found ${existingSandboxes.length} running sandbox(es); parallel mode will continue.`);
     } else {
       console.error(`[Looper] ERROR: Found ${existingSandboxes.length} running sandbox(es) for this project:`);
       for (const sb of existingSandboxes) {
@@ -268,6 +315,11 @@ async function runInModal() {
       REPOSITORY_BRANCH: config.branch,
       WORKSPACE_DIR: projectDir,
       MAX_SESSIONS: String(config.sessions),
+      LOOPER_PARALLEL_WORKERS: String(config.parallelWorkers ?? 1),
+      ...(config.cleanTaskBranches ? { LOOPER_CLEAN_TASK_BRANCHES: "1" } : {}),
+      ...(config.continuous ? { LOOPER_CONTINUOUS: "1" } : {}),
+      ...(config.specAuditMaxAreas ? { LOOPER_SPEC_AUDIT_MAX_AREAS: String(config.specAuditMaxAreas) } : {}),
+      ...(config.specAuditParallelism ? { LOOPER_SPEC_AUDIT_PARALLELISM: String(config.specAuditParallelism) } : {}),
       MODEL: config.model,
       LOOPER_STOP_FILE: STOP_FILE_PATH,
       // Playwright needs to find the browsers installed during image build
@@ -275,6 +327,7 @@ async function runInModal() {
       ...(config.claudeOAuthCredentials ? { CLAUDE_CONFIG_DIR: "/home/looper/.config/claude" } : {}),
       ...(config.reviewAgent ? { REVIEW_AGENT: config.reviewAgent } : {}),
       ...(config.codexModel ? { CODEX_MODEL: config.codexModel } : {}),
+      ...(config.prompts ? { LOOPER_PROMPTS_JSON: JSON.stringify(config.prompts) } : {}),
     },
     secrets,
   });
@@ -429,7 +482,8 @@ function buildImage(client: ModalClient) {
 async function uploadCode(sandbox: Sandbox, config: Config) {
   console.log("[Looper] Uploading code...");
 
-  for (const file of ["harness.ts", "run.ts", "package.json", "tsconfig.json"]) {
+  const files = await listHarnessFiles(process.cwd());
+  for (const file of files) {
     const content = await fs.readFile(path.join(process.cwd(), file), "utf8");
     await writeFileToSandbox(sandbox, `/harness/${file}`, content);
   }
@@ -443,6 +497,18 @@ async function uploadCode(sandbox: Sandbox, config: Config) {
     mirrorToSandboxLogs: true,
   });
   if (result.exitCode !== 0) throw new Error("npm install failed");
+}
+
+async function listHarnessFiles(baseDir: string): Promise<string[]> {
+  const entries = await fs.readdir(baseDir, { withFileTypes: true });
+  const files: string[] = [];
+  for (const entry of entries) {
+    if (!entry.isFile()) continue;
+    if (entry.name.endsWith(".ts") || HARNESS_STATIC_FILES.has(entry.name)) {
+      files.push(entry.name);
+    }
+  }
+  return files;
 }
 
 /**
@@ -645,7 +711,7 @@ async function scheduleRenewal(stopFilePath: string) {
   const sourceDir = path.dirname(new URL(import.meta.url).pathname);
   
   // Copy only essential files, not node_modules (will reinstall in successor)
-  const essentialFiles = ["harness.ts", "run.ts", "package.json", "tsconfig.json", "spec.txt"];
+  const essentialFiles = [...await listHarnessFiles(sourceDir), "spec.txt"];
   for (const file of essentialFiles) {
     try {
       const srcPath = path.join(sourceDir, file);
@@ -681,7 +747,7 @@ async function scheduleRenewal(stopFilePath: string) {
       const secrets = Object.keys(secretEntries).length ? [await client.secrets.fromObject(secretEntries)] : [];
 
       const sandbox = await client.sandboxes.create(app, buildImage(client), {
-        cpu: 4.0, memoryMiB: 16384, timeoutMs: 24 * 60 * 60 * 1000,
+        cpu: 2.0, memoryMiB: 4096, timeoutMs: 24 * 60 * 60 * 1000,
         volumes: { "/workspace": volume }, env, secrets,
       });
 
@@ -706,12 +772,20 @@ async function runHarness() {
   const stopFilePath = process.env.LOOPER_STOP_FILE ?? path.join(workingDir, ".looper-stop-after-session");
   const reviewAgent = process.env.REVIEW_AGENT as "claude" | "codex" | undefined;
   const codexModel = process.env.CODEX_MODEL;
+  const promptsJson = process.env.LOOPER_PROMPTS_JSON;
+  const prompts = promptsJson ? JSON.parse(promptsJson) as LongRunningHarnessConfig["prompts"] : undefined;
+  const role = process.env.LOOPER_ROLE ?? "controller";
+  const parallelWorkers = parseInt(process.env.LOOPER_PARALLEL_WORKERS ?? "1", 10);
+  const cleanTaskBranches = process.env.LOOPER_CLEAN_TASK_BRANCHES === "1";
+  const continuous = process.env.LOOPER_CONTINUOUS === "1";
+  const specAuditMaxAreasRaw = parseInt(process.env.LOOPER_SPEC_AUDIT_MAX_AREAS ?? "", 10);
+  const specAuditParallelismRaw = parseInt(process.env.LOOPER_SPEC_AUDIT_PARALLELISM ?? "", 10);
+  const specAuditMaxAreas = Number.isFinite(specAuditMaxAreasRaw) ? specAuditMaxAreasRaw : undefined;
+  const specAuditParallelism = Number.isFinite(specAuditParallelismRaw) ? specAuditParallelismRaw : undefined;
+  const workerTaskId = process.env.LOOPER_TASK_ID;
+  const workerTaskBranch = process.env.LOOPER_TASK_BRANCH;
 
   const projectSpec = await fs.readFile(specFile, "utf8");
-  await fs.rm(stopFilePath, { force: true });
-
-  // Schedule self-renewal before 24h timeout (also caches harness to volume)
-  await scheduleRenewal(stopFilePath);
 
   const oauthCredentialsJson = process.env.CLAUDE_CODE_CREDENTIALS_JSON;
   if (oauthCredentialsJson) {
@@ -743,6 +817,80 @@ async function runHarness() {
   console.log(`[Harness] Model: ${model}`);
   console.log(`[Harness] Sessions: ${maxSessions}`);
   console.log(`[Harness] Review agent: ${reviewAgent ?? "codex"}${codexModel ? ` (model: ${codexModel})` : ""}`);
+  console.log(`[Harness] Continuous: ${continuous ? "yes" : "no"}`);
+  if (continuous) {
+    console.log(
+      `[Harness] Spec audit: maxAreas=${specAuditMaxAreas ?? 10}, parallelism=${specAuditParallelism ?? 3}`
+    );
+  }
+
+  if (role === "worker") {
+    if (!workerTaskId || !workerTaskBranch) {
+      throw new Error("Worker mode requires LOOPER_TASK_ID and LOOPER_TASK_BRANCH");
+    }
+
+    const workerHarness = new LongRunningHarness({
+      workingDir,
+      projectSpec,
+      projectName,
+      model,
+      repositoryUrl: repoUrl,
+      branch: workerTaskBranch,
+      gitToken: process.env.GITHUB_TOKEN,
+      useProjectSettings: true,
+      stopFilePath,
+      enableReviewAgent: true,
+      maxReviewIterations: 5,
+      maxReviewTurns: 100,
+      reviewAgent,
+      codexModel,
+      prompts,
+      mcpServers: {
+        playwright: {
+          command: "npx",
+          args: [
+            "-y",
+            "@playwright/mcp@latest",
+            "--browser", "chromium",
+            "--headless",
+          ],
+        },
+      },
+    });
+
+    const success = await workerHarness.runSingleTask(workerTaskId, true);
+    process.exit(success ? 0 : 1);
+  }
+
+  await fs.rm(stopFilePath, { force: true });
+
+  // Schedule self-renewal before 24h timeout (also caches harness to volume)
+  await scheduleRenewal(stopFilePath);
+
+  if (parallelWorkers > 1) {
+    try {
+      await runParallelController({
+        projectName,
+        projectSpec,
+        repoUrl,
+        branch,
+        model,
+        workingDir,
+        parallelWorkers,
+        stopFilePath,
+        cleanTaskBranches,
+        prompts,
+        continuous,
+        specAuditMaxAreas,
+        specAuditParallelism,
+      });
+      console.log("[Harness] Parallel controller completed successfully, exiting.");
+      process.exit(0);
+    } catch (err) {
+      console.error("[Harness] Parallel controller failed:", err instanceof Error ? err.message : err);
+      process.exit(1);
+    }
+  }
 
   const harness = new LongRunningHarness({
     workingDir,
@@ -760,6 +908,10 @@ async function runHarness() {
     maxReviewTurns: 100,
     reviewAgent,
     codexModel,
+    prompts,
+    continuous,
+    specAuditMaxAreas,
+    specAuditParallelism,
     // Playwright MCP for browser automation during testing
     // Use the Chromium binary installed in the image (not Chrome, which requires sudo)
     mcpServers: {
@@ -807,6 +959,569 @@ async function runHarness() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Parallel controller
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function runParallelController(cfg: ParallelControllerConfig): Promise<void> {
+  const {
+    projectName,
+    projectSpec,
+    repoUrl,
+    branch,
+    model,
+    workingDir,
+    parallelWorkers,
+    stopFilePath,
+    cleanTaskBranches,
+    prompts,
+    continuous,
+    specAuditMaxAreas,
+    specAuditParallelism,
+  } = cfg;
+
+  const harness = new LongRunningHarness({
+    workingDir,
+    projectSpec,
+    projectName,
+    model,
+    repositoryUrl: repoUrl,
+    branch,
+    gitToken: process.env.GITHUB_TOKEN,
+    useProjectSettings: true,
+    stopFilePath,
+    enableReviewAgent: false,
+    prompts,
+    continuous,
+    specAuditMaxAreas,
+    specAuditParallelism,
+    mcpServers: {
+      playwright: {
+        command: "npx",
+        args: [
+          "-y",
+          "@playwright/mcp@latest",
+          "--browser", "chromium",
+          "--headless",
+        ],
+      },
+    },
+  });
+
+  await harness.ensureInitialized();
+
+  const client = new ModalClient();
+  const app = await client.apps.fromName(`looper-${projectName}`, { createIfMissing: true });
+
+  const volumePool = new Map<number, any>();
+  for (let i = 1; i <= parallelWorkers; i++) {
+    const volume = await client.volumes.fromName(`${projectName}-worker-${i}`, { createIfMissing: true });
+    volumePool.set(i, volume);
+  }
+
+  const availableSlots = Array.from({ length: parallelWorkers }, (_, i) => i + 1);
+  const activeWorkers = new Map<string, WorkerState>();
+
+  if (cleanTaskBranches) {
+    await cleanupRemoteTaskBranches(workingDir, repoUrl, process.env.GITHUB_TOKEN);
+  }
+
+  const workerConfig: Config = {
+    projectName,
+    instruction: projectSpec,
+    sessions: 1,
+    cpu: 2.0,
+    memoryMb: 4096,
+    timeoutSecs: 0,
+    repoUrl,
+    branch,
+    model,
+    githubToken: process.env.GITHUB_TOKEN,
+    anthropicApiKey: process.env.ANTHROPIC_API_KEY,
+    parallelWorkers: 1,
+    cleanTaskBranches: false,
+  };
+
+  while (true) {
+    if (await shouldStop(stopFilePath)) {
+      console.log("[Harness] Stop requested; exiting parallel controller.");
+      break;
+    }
+
+    await syncControllerRepo(workingDir, repoUrl, branch, process.env.GITHUB_TOKEN);
+
+    const tasks = await harness.readTaskList();
+    const baseSha = (await execGit(["-C", workingDir, "rev-parse", `origin/${branch}`], buildGitEnv())).trim();
+    const inProgressRemote = await getActiveRemoteTasks(
+      workingDir,
+      repoUrl,
+      process.env.GITHUB_TOKEN,
+      tasks,
+      activeWorkers,
+      baseSha
+    );
+    const inProgress = new Set<string>([...inProgressRemote, ...activeWorkers.keys()]);
+    const inProgressTasks = tasks.filter((task) => inProgress.has(task.id));
+
+    const readyTasks = getReadyTasks(tasks, { inProgress, inProgressTasks });
+
+    while (availableSlots.length > 0 && readyTasks.length > 0) {
+      const task = readyTasks.shift()!;
+      const slot = availableSlots.shift()!;
+      const branchName = `task/${task.id}`;
+
+      const claimed = await claimTaskBranch(workingDir, repoUrl, branch, task.id, process.env.GITHUB_TOKEN);
+      if (!claimed) {
+        availableSlots.push(slot);
+        continue;
+      }
+
+      const volume = volumePool.get(slot)!;
+      const worker = await spawnWorkerSandbox({
+        client,
+        app,
+        volume,
+        workerConfig,
+        projectName,
+        repoUrl,
+        branch: branchName,
+        task,
+      }, slot);
+
+      activeWorkers.set(task.id, worker);
+      console.log(`[Harness] Worker started for ${task.id} on slot ${slot} (${worker.sandbox.sandboxId})`);
+    }
+
+    if (activeWorkers.size === 0) {
+      const remaining = tasks.filter((task) => task.passes !== true);
+      if (remaining.length === 0) {
+        if (!continuous) {
+          console.log("[Harness] All tasks are marked as passing. Parallel run complete.");
+          break;
+        }
+
+        console.log("[Harness] All tasks passing; running spec audit...");
+        const auditResult = await harness.runSpecAudit();
+        if (auditResult.addedTasks === 0 && auditResult.reopenedTasks === 0) {
+          console.log("[Harness] Spec audit passed with no new tasks. Parallel run complete.");
+          break;
+        }
+        console.log(
+          `[Harness] Spec audit added ${auditResult.addedTasks} task(s) and reopened ${auditResult.reopenedTasks} task(s); continuing.`
+        );
+        continue;
+      }
+
+      if (readyTasks.length === 0) {
+        if (inProgressRemote.size > 0) {
+          console.log("[Harness] Waiting for in-progress remote tasks to finish...");
+          await delay(10000);
+          continue;
+        }
+        console.warn(`[Harness] No ready tasks but ${remaining.length} task(s) remain. Check dependencies.`);
+        break;
+      }
+    }
+
+    if (activeWorkers.size === 0) {
+      await delay(5000);
+      continue;
+    }
+
+    const result = await waitForAnyWorker(activeWorkers);
+    const finished = activeWorkers.get(result.taskId);
+    if (finished) {
+      activeWorkers.delete(result.taskId);
+      availableSlots.push(finished.slot);
+    }
+
+    if (result.exitCode === 0) {
+      const mergeOk = await mergeTaskBranch(workingDir, repoUrl, branch, result.branch, process.env.GITHUB_TOKEN);
+      if (mergeOk && finished) {
+        await finalizeTaskCompletion(workingDir, repoUrl, branch, finished.task, process.env.GITHUB_TOKEN);
+        await deleteRemoteTaskBranch(workingDir, repoUrl, result.branch, process.env.GITHUB_TOKEN);
+      } else {
+        console.warn(`[Harness] Merge failed for ${result.taskId}; leaving branch ${result.branch} for inspection.`);
+      }
+    } else {
+      console.warn(`[Harness] Worker for ${result.taskId} exited with code ${result.exitCode}.`);
+    }
+  }
+}
+
+async function spawnWorkerSandbox(
+  params: {
+    client: ModalClient;
+    app: any;
+    volume: any;
+    workerConfig: Config;
+    projectName: string;
+    repoUrl: string;
+    branch: string;
+    task: TaskSpec;
+  },
+  slot: number
+): Promise<WorkerState> {
+  const { client, app, volume, workerConfig, projectName, repoUrl, branch, task } = params;
+
+  const env = Object.fromEntries(
+    Object.entries(process.env).filter((e): e is [string, string] => e[1] !== undefined)
+  );
+  env.__LOOPER_IN_MODAL = "1";
+  env.PROJECT_NAME = projectName;
+  env.PROJECT_SPEC_FILE = "/harness/spec.txt";
+  env.REPOSITORY_URL = repoUrl;
+  env.REPOSITORY_BRANCH = branch;
+  env.WORKSPACE_DIR = `/workspace/${projectName}`;
+  env.MAX_SESSIONS = "1";
+  env.MODEL = workerConfig.model;
+  env.LOOPER_ROLE = "worker";
+  env.LOOPER_TASK_ID = task.id;
+  env.LOOPER_TASK_BRANCH = branch;
+
+  const secretKeys = ["GITHUB_TOKEN", "ANTHROPIC_API_KEY", "CLAUDE_CODE_CREDENTIALS_JSON", "CODEX_CREDENTIALS_JSON", "MODAL_TOKEN_ID", "MODAL_TOKEN_SECRET"];
+  const secretEntries = Object.fromEntries(secretKeys.filter(k => env[k]).map(k => [k, env[k]]));
+  const secrets = Object.keys(secretEntries).length ? [await client.secrets.fromObject(secretEntries)] : [];
+
+  const sandbox = await client.sandboxes.create(app, buildImage(client), {
+    cpu: workerConfig.cpu,
+    memoryMiB: workerConfig.memoryMb,
+    timeoutMs: 24 * 60 * 60 * 1000,
+    volumes: { "/workspace": volume },
+    env,
+    secrets,
+  });
+
+  await uploadCode(sandbox, workerConfig);
+
+  const setupCmd = `sudo mkdir -p /workspace/${projectName} && sudo chown -R looper:looper /workspace/${projectName} && sudo rm -f /workspace/${projectName}/.git/index.lock /workspace/${projectName}/.git/*.lock 2>/dev/null || true`;
+  const setupResult = await exec(sandbox, setupCmd, "/harness", { stream: true });
+  if (setupResult.exitCode !== 0) {
+    await sandbox.terminate().catch(() => {});
+    throw new Error(`Worker ${slot} setup failed with exit code ${setupResult.exitCode}`);
+  }
+
+  const cmd = `echo "[Looper] Worker ${slot} starting..." && sudo -E -u looper HOME=/home/looper npx tsx run.ts`;
+  const promise = exec(sandbox, cmd, "/harness", {
+    stream: true,
+    mirrorToSandboxLogs: true,
+  }).then(async (result) => {
+    await sandbox.terminate().catch(() => {});
+    return { taskId: task.id, branch, exitCode: result.exitCode };
+  }).catch(async () => {
+    await sandbox.terminate().catch(() => {});
+    return { taskId: task.id, branch, exitCode: 1 };
+  });
+
+  return {
+    task,
+    branch,
+    sandbox,
+    slot,
+    promise,
+  };
+}
+
+async function waitForAnyWorker(activeWorkers: Map<string, WorkerState>): Promise<WorkerResult> {
+  const promises = Array.from(activeWorkers.values()).map((worker) => worker.promise);
+  return Promise.race(promises);
+}
+
+function buildGitEnv(): NodeJS.ProcessEnv {
+  return {
+    ...process.env,
+    GIT_TERMINAL_PROMPT: "0",
+  };
+}
+
+function getAuthenticatedRepoUrl(repoUrl: string, gitToken?: string): string {
+  if (!gitToken) return repoUrl;
+  try {
+    const url = new URL(repoUrl);
+    if (url.protocol === "https:") {
+      url.username = "x-access-token";
+      url.password = gitToken;
+      return url.toString();
+    }
+  } catch {
+    return repoUrl;
+  }
+  return repoUrl;
+}
+
+async function execGit(args: string[], env: NodeJS.ProcessEnv): Promise<string> {
+  const redactedArgs = args.map(a => a.replace(/x-access-token:[^@]+@/g, "x-access-token:***@"));
+  console.log(`[Git] git ${redactedArgs.join(" ")}`);
+  const { stdout } = await execFileAsync("git", args, { env });
+  return stdout.toString();
+}
+
+
+async function withAuthRemote<T>(
+  workingDir: string,
+  repoUrl: string,
+  gitToken: string | undefined,
+  fn: (env: NodeJS.ProcessEnv) => Promise<T>
+): Promise<T> {
+  const env = buildGitEnv();
+  const authUrl = getAuthenticatedRepoUrl(repoUrl, gitToken);
+  await execGit(["-C", workingDir, "remote", "set-url", "origin", authUrl], env);
+  try {
+    return await fn(env);
+  } finally {
+    await execGit(["-C", workingDir, "remote", "set-url", "origin", repoUrl], env);
+  }
+}
+
+async function syncControllerRepo(
+  workingDir: string,
+  repoUrl: string,
+  branch: string,
+  gitToken?: string
+): Promise<void> {
+  await withAuthRemote(workingDir, repoUrl, gitToken, async (env) => {
+    await execGit(["-C", workingDir, "fetch", "origin", branch], env);
+    await execGit(["-C", workingDir, "checkout", branch], env);
+    await execGit(["-C", workingDir, "reset", "--hard", `origin/${branch}`], env);
+    await execGit(["-C", workingDir, "clean", "-fd"], env);
+  });
+}
+
+async function getRemoteTaskBranchInfo(
+  workingDir: string,
+  repoUrl: string,
+  gitToken?: string
+): Promise<Map<string, { sha: string; commitTimeMs: number }>> {
+  return withAuthRemote(workingDir, repoUrl, gitToken, async (env) => {
+    try {
+      await execGit(
+        ["-C", workingDir, "fetch", "origin", "refs/heads/task/*:refs/remotes/origin/task/*"],
+        env
+      );
+    } catch {
+      return new Map();
+    }
+
+    const output = await execGit(
+      [
+        "-C",
+        workingDir,
+        "for-each-ref",
+        "--format=%(refname:strip=3) %(objectname) %(committerdate:unix)",
+        "refs/remotes/origin/task",
+      ],
+      env
+    );
+
+    const map = new Map<string, { sha: string; commitTimeMs: number }>();
+    const lines = output.trim().split("\n").filter(Boolean);
+    for (const line of lines) {
+      const [ref, sha, ts] = line.trim().split(/\s+/);
+      if (!ref || !sha || !ts) continue;
+      if (!ref.startsWith("task/")) continue;
+      const taskId = ref.slice("task/".length);
+      const time = parseInt(ts, 10);
+      if (!Number.isNaN(time)) {
+        map.set(taskId, { sha, commitTimeMs: time * 1000 });
+      }
+    }
+    return map;
+  });
+}
+
+async function listRemoteTaskBranchNames(
+  workingDir: string,
+  repoUrl: string,
+  gitToken?: string
+): Promise<string[]> {
+  return withAuthRemote(workingDir, repoUrl, gitToken, async (env) => {
+    const output = await execGit(["-C", workingDir, "ls-remote", "--heads", "origin", "task/*"], env);
+    const branches: string[] = [];
+    const lines = output.trim().split("\n").filter(Boolean);
+    for (const line of lines) {
+      const [, ref] = line.split(/\s+/);
+      if (ref?.startsWith("refs/heads/task/")) {
+        branches.push(ref.replace("refs/heads/", ""));
+      }
+    }
+    return branches;
+  });
+}
+
+async function cleanupRemoteTaskBranches(
+  workingDir: string,
+  repoUrl: string,
+  gitToken?: string
+): Promise<void> {
+  const branches = await listRemoteTaskBranchNames(workingDir, repoUrl, gitToken);
+  if (branches.length === 0) {
+    console.log("[Harness] No remote task branches to clean.");
+    return;
+  }
+
+  console.log(`[Harness] Cleaning ${branches.length} remote task branch(es)...`);
+  for (const branch of branches) {
+    await deleteRemoteTaskBranch(workingDir, repoUrl, branch, gitToken);
+  }
+}
+
+async function getActiveRemoteTasks(
+  workingDir: string,
+  repoUrl: string,
+  gitToken: string | undefined,
+  tasks: TaskSpec[],
+  activeWorkers: Map<string, WorkerState>,
+  baseSha: string
+): Promise<Set<string>> {
+  const taskMap = new Map(tasks.map((task) => [task.id, task]));
+  const remoteBranches = await getRemoteTaskBranchInfo(workingDir, repoUrl, gitToken);
+  const now = Date.now();
+
+  const active = new Set<string>();
+  for (const [taskId, info] of remoteBranches) {
+    const task = taskMap.get(taskId);
+    if (task?.passes === true) {
+      await deleteRemoteTaskBranch(workingDir, repoUrl, `task/${taskId}`, gitToken);
+      continue;
+    }
+
+    if (activeWorkers.has(taskId)) {
+      active.add(taskId);
+      continue;
+    }
+
+    if (info.sha !== baseSha && now - info.commitTimeMs > STALE_BRANCH_MS) {
+      console.warn(`[Harness] Reclaiming stale task branch for ${taskId}.`);
+      await deleteRemoteTaskBranch(workingDir, repoUrl, `task/${taskId}`, gitToken);
+      continue;
+    }
+
+    active.add(taskId);
+  }
+
+  return active;
+}
+
+async function claimTaskBranch(
+  workingDir: string,
+  repoUrl: string,
+  baseBranch: string,
+  taskId: string,
+  gitToken?: string
+): Promise<boolean> {
+  return withAuthRemote(workingDir, repoUrl, gitToken, async (env) => {
+    await execGit(["-C", workingDir, "fetch", "origin", baseBranch], env);
+    const baseSha = (await execGit(["-C", workingDir, "rev-parse", `origin/${baseBranch}`], env)).trim();
+    const branchRef = `refs/heads/task/${taskId}`;
+    const lease = `${branchRef}:0000000000000000000000000000000000000000`;
+
+    try {
+      await execGit(["-C", workingDir, "push", "--force-with-lease=" + lease, "origin", `${baseSha}:${branchRef}`], env);
+      return true;
+    } catch (err) {
+      console.warn(`[Harness] Failed to claim task branch for ${taskId}:`, err);
+      return false;
+    }
+  });
+}
+
+async function mergeTaskBranch(
+  workingDir: string,
+  repoUrl: string,
+  baseBranch: string,
+  taskBranch: string,
+  gitToken?: string
+): Promise<boolean> {
+  return withAuthRemote(workingDir, repoUrl, gitToken, async (env) => {
+    try {
+      await execGit(["-C", workingDir, "fetch", "origin", baseBranch], env);
+      await execGit(["-C", workingDir, "fetch", "origin", taskBranch], env);
+      await execGit(["-C", workingDir, "checkout", baseBranch], env);
+      await execGit(["-C", workingDir, "reset", "--hard", `origin/${baseBranch}`], env);
+      await execGit(["-C", workingDir, "checkout", "-B", taskBranch, `origin/${taskBranch}`], env);
+      await execGit(["-C", workingDir, "rebase", `origin/${baseBranch}`], env);
+      await execGit(["-C", workingDir, "checkout", baseBranch], env);
+      await execGit(["-C", workingDir, "merge", "--ff-only", taskBranch], env);
+      await execGit(["-C", workingDir, "push", "origin", baseBranch], env);
+      return true;
+    } catch (err) {
+      try {
+        await execGit(["-C", workingDir, "rebase", "--abort"], env);
+      } catch {
+        // ignore
+      }
+      console.warn(`[Harness] Merge failed for ${taskBranch}:`, err);
+      return false;
+    }
+  });
+}
+
+async function finalizeTaskCompletion(
+  workingDir: string,
+  repoUrl: string,
+  baseBranch: string,
+  task: TaskSpec,
+  gitToken?: string
+): Promise<void> {
+  await withAuthRemote(workingDir, repoUrl, gitToken, async (env) => {
+    await execGit(["-C", workingDir, "fetch", "origin", baseBranch], env);
+    await execGit(["-C", workingDir, "checkout", baseBranch], env);
+    await execGit(["-C", workingDir, "reset", "--hard", `origin/${baseBranch}`], env);
+
+    const taskListPath = path.join(workingDir, "task_list.json");
+    const raw = await fs.readFile(taskListPath, "utf8");
+    const data = JSON.parse(raw) as TaskSpec[];
+    const entry = data.find((item) => item.id === task.id);
+    if (!entry) {
+      throw new Error(`Task ${task.id} not found when marking complete.`);
+    }
+    entry.passes = true;
+
+    await fs.writeFile(taskListPath, JSON.stringify(data, null, 2) + "\n");
+
+    const progressPath = path.join(workingDir, "claude-progress.txt");
+    const logEntry = `[${new Date().toISOString()}] Completed ${task.id}: ${task.description}\n`;
+    await fs.appendFile(progressPath, logEntry, "utf8");
+
+    await execGit(["-C", workingDir, "add", "task_list.json", "claude-progress.txt"], env);
+    await execGit(["-C", workingDir, "commit", "-m", `Complete ${task.id}: ${task.description}`], env);
+    await execGit(["-C", workingDir, "push", "origin", baseBranch], env);
+  });
+}
+
+async function deleteRemoteTaskBranch(
+  workingDir: string,
+  repoUrl: string,
+  taskBranch: string,
+  gitToken?: string
+): Promise<void> {
+  await withAuthRemote(workingDir, repoUrl, gitToken, async (env) => {
+    try {
+      await execGit(["-C", workingDir, "push", "origin", "--delete", taskBranch], env);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (msg.includes("remote ref does not exist") || msg.includes("unable to delete")) {
+        console.warn(`[Harness] Remote branch ${taskBranch} already deleted; skipping.`);
+        return;
+      }
+      throw err;
+    }
+  });
+}
+
+async function shouldStop(stopFilePath: string): Promise<boolean> {
+  try {
+    await fs.access(stopFilePath);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Argument parsing
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -816,17 +1531,20 @@ async function parseArgs(): Promise<Config> {
     projectName: "",
     instruction: "",
     sessions: 0, // 0 = unlimited sessions until tasks complete or stop file
-    cpu: 4.0,
-    memoryMb: 16384, // 16GB
+    cpu: 2.0,
+    memoryMb: 4096, // 4GB
     timeoutSecs: 0, // 0 = no timeout
     repoUrl: "",
     branch: "main",
-    model: "sonnet",
+    model: "opus",
     githubToken: process.env.GITHUB_TOKEN,
     anthropicApiKey: process.env.ANTHROPIC_API_KEY,
+    parallelWorkers: 1,
+    continuous: false,
   };
 
   let instructionFile = "";
+  let promptsFile = "";
   let i = 0;
 
   while (i < args.length) {
@@ -834,6 +1552,7 @@ async function parseArgs(): Promise<Config> {
     switch (arg) {
       case "--instruction": config.instruction = args[++i]; break;
       case "--instruction-file": instructionFile = args[++i]; break;
+      case "--prompts-file": promptsFile = args[++i]; break;
       case "--sessions": config.sessions = parseInt(args[++i], 10); break;
       case "--cpu": config.cpu = parseFloat(args[++i]); break;
       case "--memory": config.memoryMb = parseInt(args[++i], 10); break;
@@ -854,6 +1573,11 @@ async function parseArgs(): Promise<Config> {
         break;
       }
       case "--codex-model": config.codexModel = args[++i]; break;
+      case "--parallel": config.parallelWorkers = parseInt(args[++i], 10); break;
+      case "--clean-task-branches": config.cleanTaskBranches = true; break;
+      case "--continuous": config.continuous = true; break;
+      case "--spec-audit-max-areas": config.specAuditMaxAreas = parseInt(args[++i], 10); break;
+      case "--spec-audit-parallelism": config.specAuditParallelism = parseInt(args[++i], 10); break;
       case "-h": case "--help": printUsage(); process.exit(0);
       default:
         if (!arg.startsWith("-") && !config.projectName) {
@@ -865,6 +1589,16 @@ async function parseArgs(): Promise<Config> {
 
   if (instructionFile && !config.instruction) {
     config.instruction = await fs.readFile(instructionFile, "utf8");
+  }
+
+  if (promptsFile) {
+    try {
+      const promptsContent = await fs.readFile(promptsFile, "utf8");
+      config.prompts = JSON.parse(promptsContent);
+    } catch (err) {
+      console.error(`Error: Failed to read prompts file from ${promptsFile}:`, err);
+      process.exit(1);
+    }
   }
 
   if (config.claudeOAuthFile) {
@@ -904,13 +1638,19 @@ Usage: npx tsx run.ts <project-name> [options]
 Options:
   --instruction <text>     Project spec as string
   --instruction-file <f>   Path to spec file
+  --prompts-file <f>       Path to JSON file with prompt overrides (for non-code domains)
   --sessions <n>           Working sessions (default: unlimited if 0)
   --cpu <cores>            CPU cores (default: 4.0)
   --memory <mb>            Memory MB (default: 16384)
   --timeout <secs>         Timeout seconds (default: none if 0)
+  --parallel <n>           Parallel worker sandboxes (default: 1)
+  --clean-task-branches    Delete all remote task/* branches before starting
+  --continuous             After tasks complete, run a Codex spec audit and continue if new tasks are added
+  --spec-audit-max-areas <n> Max audit areas/reviewers (default: 10)
+  --spec-audit-parallelism <n> Max parallel Codex reviewers (default: 3)
   --repo-url <url>         GitHub repo URL
   --branch <branch>        Git branch (default: main)
-  --model <model>          Claude model: sonnet, opus, etc. (default: sonnet)
+  --model <model>          Claude model: opus, sonnet, etc. (default: opus)
   --claude-oauth-file <f>  Path to Claude Code OAuth credentials JSON (default: ./.claude-code-credentials.json)
   --review-agent <agent>   Code review agent: claude, codex (default: codex)
   --codex-model <model>    Codex CLI model for review (default: codex's default)
