@@ -126,9 +126,63 @@ export interface LongRunningHarnessConfig {
    * If not specified, uses Codex CLI default.
    */
   codexModel?: string;
+
+  /**
+   * Enable continuous mode: run a spec audit when all tasks are passing.
+   * The audit can add or reopen tasks, then the harness continues.
+   */
+  continuous?: boolean;
+
+  /**
+   * Max number of spec audit areas (reviewers) for Codex CLI.
+   * The model decides the actual number up to this cap.
+   */
+  specAuditMaxAreas?: number;
+
+  /**
+   * Max parallel Codex reviewers during spec audit.
+   */
+  specAuditParallelism?: number;
+
+  /**
+   * Optional Codex model override for spec audit.
+   * Defaults to codexModel when omitted.
+   */
+  specAuditModel?: string;
+
+  /**
+   * Domain-specific prompt overrides. Use this to adapt Looper for non-code domains
+   * like philosophical inquiry, research, writing, etc.
+   */
+  prompts?: {
+    /**
+     * Custom verification criteria for the working agent.
+     * Replaces the default "test like a real user" section.
+     */
+    verificationCriteria?: string;
+
+    /**
+     * Custom review checklist for the review agent.
+     * Replaces the default code-audit checklist.
+     */
+    reviewChecklist?: string;
+
+    /**
+     * Custom red flags that auto-fail review.
+     * Replaces default patterns like #[ignore], stub, TODO.
+     * Set to empty array to disable red flag detection.
+     */
+    redFlagPatterns?: string[];
+
+    /**
+     * Custom task completion criteria.
+     * Appended to working agent prompt.
+     */
+    completionCriteria?: string;
+  };
 }
 
-export type HarnessPhase = "planning" | "working" | "review" | "fixing";
+export type HarnessPhase = "planning" | "working" | "review" | "fixing" | "audit";
 
 interface ProjectPaths {
   taskList: string;
@@ -137,15 +191,57 @@ interface ProjectPaths {
   gitDir: string;
 }
 
-interface TaskSpec {
+export interface TaskSpec {
   id: string;
   category: string;
   description: string;
   steps: string[];
   passes?: boolean;
+  depends_on?: string[];
+  scope?: string[];
 }
 
 type TaskList = TaskSpec[];
+
+interface SpecAuditPlanArea {
+  id: string;
+  title: string;
+  focus: string;
+  paths?: string[];
+  rationale?: string;
+}
+
+interface SpecAuditPlan {
+  areas: SpecAuditPlanArea[];
+  notes?: string[];
+}
+
+interface SpecAuditIssue {
+  issue: string;
+  evidence?: string;
+  severity?: string;
+  spec_ref?: string;
+}
+
+interface SpecAuditAreaResult {
+  area_id: string;
+  status: "PASS" | "FAIL";
+  summary?: string;
+  issues?: SpecAuditIssue[];
+  notes?: string[];
+}
+
+interface SpecAuditReopen {
+  id: string;
+  reason?: string;
+}
+
+interface SpecAuditSynthesis {
+  result: "PASS" | "FAIL";
+  new_tasks?: TaskSpec[];
+  reopen_tasks?: SpecAuditReopen[];
+  summary?: string[];
+}
 
 interface SessionResult {
   sessionId: string | null;
@@ -284,7 +380,7 @@ export class LongRunningHarness {
 
     // If review agent is enabled, use the ping-pong flow
     if (this.cfg.enableReviewAgent && nextTask) {
-      return this.runWorkingSessionWithReview(nextTask, isProjectSetup, options);
+      return this.runWorkingSessionWithReview(nextTask, isProjectSetup, options, false);
     }
 
     // Original flow without review agent
@@ -313,6 +409,60 @@ export class LongRunningHarness {
   }
 
   /**
+   * Run a single working session for a specific task.
+   * Used by parallel workers that must not update coordination artifacts.
+   */
+  async runSingleTask(taskId: string, workerMode = false): Promise<boolean> {
+    log("Harness", `Starting single-task session for: ${taskId}`);
+
+    await this.ensureInitialized();
+
+    const taskList = await this.readTaskList();
+    const task = taskList.find((item) => item.id === taskId);
+    if (!task) {
+      throw new Error(`Task ${taskId} not found in task_list.json`);
+    }
+
+    const isProjectSetup = task.id === "project-setup";
+    const options: Options = {
+      ...this.buildBaseOptions("working"),
+      maxTurns: this.cfg.maxWorkingTurns,
+      permissionMode: "bypassPermissions",
+      allowDangerouslySkipPermissions: true,
+      ...this.cfg.sdkOptionsOverride,
+    };
+
+    if (this.cfg.enableReviewAgent) {
+      return this.runWorkingSessionWithReview(task, isProjectSetup, options, workerMode);
+    }
+
+    const prompt = workerMode
+      ? this.buildWorkingPromptForWorker(isProjectSetup, task)
+      : this.buildWorkingPrompt(isProjectSetup, task);
+
+    try {
+      await this.runQuery(prompt, options, "working");
+      log("Harness", "Single-task session complete, checking for commits to push...");
+      await this.pushIfNeeded("working");
+      log("Harness", "═══════════════════════════════════════════════════════════");
+      return true;
+    } catch (err) {
+      console.error("[Harness] ═══════════════════════════════════════════════════════════");
+      console.error("[Harness] Single-task session failed with error:");
+      console.error("[Harness]", err instanceof Error ? err.message : err);
+      console.error("[Harness] ═══════════════════════════════════════════════════════════");
+
+      try {
+        await this.pushIfNeeded("working");
+      } catch (pushErr) {
+        console.warn("[Harness] Failed to push after error:", pushErr);
+      }
+
+      return false;
+    }
+  }
+
+  /**
    * Run working session with review agent ping-pong.
    *
    * Flow:
@@ -325,7 +475,8 @@ export class LongRunningHarness {
   private async runWorkingSessionWithReview(
     task: TaskSpec,
     isProjectSetup: boolean,
-    options: Options
+    options: Options,
+    workerMode = false
   ): Promise<boolean> {
     const maxIterations = this.cfg.maxReviewIterations ?? 3;
 
@@ -344,7 +495,9 @@ export class LongRunningHarness {
         if (workingSessionId === null) {
           // First iteration: fresh implementation
           log("Harness", "Starting working agent (implementation phase)…");
-          const workingPrompt = this.buildWorkingPromptForReview(isProjectSetup, task);
+          const workingPrompt = workerMode
+            ? this.buildWorkingPromptForWorkerReview(isProjectSetup, task)
+            : this.buildWorkingPromptForReview(isProjectSetup, task);
           const result = await this.runQueryWithSessionCapture(workingPrompt, options, "working");
           workingSessionId = result.sessionId;
 
@@ -358,15 +511,19 @@ export class LongRunningHarness {
           // Subsequent iterations: resume with fix instructions
           log("Harness", "Resuming working agent (fixing phase)…");
           const lastIssues = this.lastReviewIssues ?? [];
-          const fixPrompt = this.buildFixPrompt(lastIssues, this.lastReviewIssuesPath);
+          const fixPrompt = workerMode
+            ? this.buildFixPromptForWorker(lastIssues, this.lastReviewIssuesPath)
+            : this.buildFixPrompt(lastIssues, this.lastReviewIssuesPath);
           const result = await this.resumeSession(workingSessionId, fixPrompt, options, "fixing");
 
           if (!result.success) {
             if (this.isPromptTooLong(result)) {
               log("Harness", "Working agent resume failed due to prompt length; starting a fresh fix session...");
-              const freshPrompt = this.buildFixPrompt(lastIssues, this.lastReviewIssuesPath);
-              const freshResult = await this.runQueryWithSessionCapture(freshPrompt, options, "fixing");
-              workingSessionId = freshResult.sessionId;
+            const freshPrompt = workerMode
+              ? this.buildFixPromptForWorker(lastIssues, this.lastReviewIssuesPath)
+              : this.buildFixPrompt(lastIssues, this.lastReviewIssuesPath);
+            const freshResult = await this.runQueryWithSessionCapture(freshPrompt, options, "fixing");
+            workingSessionId = freshResult.sessionId;
 
               if (!freshResult.success) {
                 console.error("[Harness] Working agent failed during fixing (fresh session)");
@@ -400,28 +557,30 @@ export class LongRunningHarness {
         log("Harness", `Starting review agent (${useCodex ? "codex" : "claude"})…`);
         let reviewResult: ReviewResult;
         if (useCodex) {
-          reviewResult = await this.runCodexReview(task, iteration > 1);
+          reviewResult = await this.runCodexReview(task, iteration > 1, workerMode);
         } else {
-          reviewResult = await this.runReviewAgent(task, options, reviewSessionId);
+          reviewResult = await this.runReviewAgent(task, options, reviewSessionId, workerMode);
           reviewSessionId = reviewResult.sessionId;
         }
 
         if (reviewResult.passed) {
           this.lastReviewIssuesPath = null;
-          // Verify the reviewer actually updated task_list.json
-          const taskList = await this.readTaskList();
-          const updatedTask = taskList.find((t) => t.id === task.id);
-          if (!updatedTask?.passes) {
-            console.warn(`[Harness] Review said PASS but task ${task.id} not marked as passing in task_list.json`);
-            console.warn("[Harness] Treating as failed review - reviewer must update task_list.json");
-            this.lastReviewIssues = ["Reviewer approved but did not update task_list.json"];
-            continue; // Go to next iteration
+          if (!workerMode) {
+            // Verify the reviewer actually updated task_list.json
+            const taskList = await this.readTaskList();
+            const updatedTask = taskList.find((t) => t.id === task.id);
+            if (!updatedTask?.passes) {
+              console.warn(`[Harness] Review said PASS but task ${task.id} not marked as passing in task_list.json`);
+              console.warn("[Harness] Treating as failed review - reviewer must update task_list.json");
+              this.lastReviewIssues = ["Reviewer approved but did not update task_list.json"];
+              continue; // Go to next iteration
+            }
           }
 
           log("Harness", "═══════════════════════════════════════════════════════════");
           log("Harness", `✓ Review agent APPROVED task: ${task.id}`);
           log("Harness", "═══════════════════════════════════════════════════════════");
-          // Only push after review approval AND task marked passing
+          // Only push after review approval (and task marked passing in controller mode)
           await this.pushIfNeeded("review");
           return true;
         }
@@ -462,7 +621,9 @@ export class LongRunningHarness {
           // Prompt too long during resume - start fresh fix session
           log("Harness", "Session context too long, starting fresh fix session...");
           try {
-            const freshPrompt = this.buildFixPrompt(this.lastReviewIssues, this.lastReviewIssuesPath);
+            const freshPrompt = workerMode
+              ? this.buildFixPromptForWorker(this.lastReviewIssues, this.lastReviewIssuesPath)
+              : this.buildFixPrompt(this.lastReviewIssues, this.lastReviewIssuesPath);
             const freshResult = await this.runQueryWithSessionCapture(freshPrompt, options, "fixing");
             workingSessionId = freshResult.sessionId;
 
@@ -516,8 +677,22 @@ export class LongRunningHarness {
     for (let i = 0; i < sessionLimit; i++) {
       const remaining = await this.countRemainingTasks();
       if (remaining === 0) {
-        log("Harness", "All tasks are marked as passing. Nothing left to do.");
-        return;
+        if (!this.cfg.continuous) {
+          log("Harness", "All tasks are marked as passing. Nothing left to do.");
+          return;
+        }
+
+        log("Harness", "All tasks passing; starting spec audit...");
+        const auditResult = await this.runSpecAudit();
+        if (auditResult.addedTasks === 0 && auditResult.reopenedTasks === 0) {
+          log("Harness", "Spec audit passed with no new tasks.");
+          return;
+        }
+        log(
+          "Harness",
+          `Spec audit added ${auditResult.addedTasks} task(s) and reopened ${auditResult.reopenedTasks} task(s); continuing.`
+        );
+        continue;
       }
 
       const limitStr = maxSessions > 0 ? `of ${maxSessions}` : "(unlimited)";
@@ -564,6 +739,589 @@ export class LongRunningHarness {
     } else {
       log("Harness", "Stopping unlimited run loop.");
     }
+  }
+
+  /**
+   * Run a spec audit when all tasks are passing.
+   * Uses the configured review agent where possible, with fallback on failure.
+   */
+  async runSpecAudit(): Promise<{ addedTasks: number; reopenedTasks: number }> {
+    const reviewAgent = this.cfg.reviewAgent ?? "codex";
+    if (reviewAgent === "claude") {
+      return this.runClaudeSpecAudit();
+    }
+
+    if (!(await this.hasCodexCredentials())) {
+      log("audit", "Codex credentials not available; falling back to Claude spec audit.");
+      return this.runClaudeSpecAudit();
+    }
+
+    try {
+      return await this.runCodexSpecAudit();
+    } catch (err) {
+      log(
+        "audit",
+        `Codex spec audit failed: ${err instanceof Error ? err.message : String(err)}`
+      );
+      try {
+        return await this.runClaudeSpecAudit();
+      } catch (fallbackErr) {
+        log(
+          "audit",
+          `Claude spec audit fallback failed: ${fallbackErr instanceof Error ? fallbackErr.message : String(fallbackErr)}`
+        );
+        return { addedTasks: 0, reopenedTasks: 0 };
+      }
+    }
+  }
+
+  /**
+   * Run a Codex-driven spec audit when all tasks are passing.
+   * Returns counts of new and reopened tasks.
+   */
+  private async runCodexSpecAudit(): Promise<{ addedTasks: number; reopenedTasks: number }> {
+    const maxAreas = Math.max(1, this.cfg.specAuditMaxAreas ?? 10);
+    const parallelism = Math.max(1, this.cfg.specAuditParallelism ?? 3);
+    const repoSummary = await this.buildRepoSummary();
+
+    const plan = await this.runCodexSpecAuditPlan(maxAreas, repoSummary);
+    const areas = this.sanitizeSpecAuditAreas(plan.areas, maxAreas);
+
+    const areaResults = await this.runSpecAuditAreas(areas, parallelism, repoSummary);
+    const taskListRaw = await fs.readFile(this.paths.taskList, "utf8");
+    const synthesis = await this.runCodexSpecAuditSynthesis(
+      plan,
+      areas,
+      areaResults,
+      taskListRaw,
+      repoSummary
+    );
+
+    const { addedTasks, reopenedTasks } = await this.applySpecAuditResults(
+      synthesis,
+      areas.length
+    );
+
+    await this.pushIfNeeded("audit");
+
+    return { addedTasks, reopenedTasks };
+  }
+
+  private async runClaudeSpecAudit(): Promise<{ addedTasks: number; reopenedTasks: number }> {
+    const before = await this.readTaskList();
+    const options: Options = {
+      ...this.buildBaseOptions("audit"),
+      maxTurns: this.cfg.maxReviewTurns ?? 60,
+      permissionMode: "bypassPermissions",
+      allowDangerouslySkipPermissions: true,
+      ...this.cfg.sdkOptionsOverride,
+    };
+
+    await this.runQuery(this.buildSpecAuditClaudePrompt(), options, "audit");
+
+    const after = await this.readTaskList();
+    const { addedTasks, reopenedTasks } = this.countTaskChanges(before, after);
+
+    await this.pushIfNeeded("audit");
+    return { addedTasks, reopenedTasks };
+  }
+
+  private countTaskChanges(
+    before: TaskList,
+    after: TaskList
+  ): { addedTasks: number; reopenedTasks: number } {
+    const beforeById = new Map(before.map((task) => [task.id, task]));
+    let addedTasks = 0;
+    let reopenedTasks = 0;
+
+    for (const task of after) {
+      const prev = beforeById.get(task.id);
+      if (!prev) {
+        addedTasks += 1;
+        continue;
+      }
+      if (prev.passes === true && task.passes === false) {
+        reopenedTasks += 1;
+      }
+    }
+
+    return { addedTasks, reopenedTasks };
+  }
+
+  private async hasCodexCredentials(): Promise<boolean> {
+    if (process.env.CODEX_CREDENTIALS_JSON) return true;
+    const home = process.env.HOME ?? "/home/looper";
+    const authPath = path.join(home, ".codex", "auth.json");
+    return pathExists(authPath);
+  }
+
+  private async runSpecAuditAreas(
+    areas: SpecAuditPlanArea[],
+    parallelism: number,
+    repoSummary: string
+  ): Promise<SpecAuditAreaResult[]> {
+    if (areas.length === 0) {
+      return [];
+    }
+
+    const queue = [...areas];
+    const results: SpecAuditAreaResult[] = [];
+    const workerCount = Math.min(parallelism, areas.length);
+
+    const workers = Array.from({ length: workerCount }, async () => {
+      while (queue.length > 0) {
+        const area = queue.shift();
+        if (!area) return;
+        const result = await this.runCodexSpecAuditArea(area, repoSummary);
+        results.push(result);
+      }
+    });
+
+    await Promise.all(workers);
+    return results;
+  }
+
+  private async buildRepoSummary(): Promise<string> {
+    try {
+      const result = await execFileAsync("git", ["-C", this.workingDir, "ls-files"]);
+      const files = result.stdout
+        .toString()
+        .split("\n")
+        .map((line) => line.trim())
+        .filter(Boolean);
+      const topLevel = new Set<string>();
+      for (const file of files) {
+        const top = file.split("/")[0];
+        if (top) topLevel.add(top);
+      }
+      const topList = Array.from(topLevel).slice(0, 25).join(", ");
+      return `Repo summary: ${files.length} tracked files. Top-level entries: ${topList || "(none)"}.`;
+    } catch {
+      return "Repo summary unavailable.";
+    }
+  }
+
+  private sanitizeSpecAuditAreas(
+    areas: SpecAuditPlanArea[] | undefined,
+    maxAreas: number
+  ): SpecAuditPlanArea[] {
+    const safeAreas = Array.isArray(areas) ? areas : [];
+    const normalized: SpecAuditPlanArea[] = [];
+    const seen = new Set<string>();
+
+    for (const area of safeAreas) {
+      if (!area || typeof area !== "object") continue;
+      const rawTitle = typeof area.title === "string" ? area.title.trim() : "";
+      const rawFocus = typeof area.focus === "string" ? area.focus.trim() : "";
+      let id = typeof area.id === "string" ? area.id.trim() : "";
+      if (!id) {
+        id = rawTitle ? this.normalizeTaskId(rawTitle) : "";
+      }
+      if (!id) continue;
+      if (seen.has(id)) {
+        let suffix = 2;
+        while (seen.has(`${id}-${suffix}`)) suffix += 1;
+        id = `${id}-${suffix}`;
+      }
+      seen.add(id);
+      normalized.push({
+        id,
+        title: rawTitle || id,
+        focus: rawFocus || "General review",
+        paths: Array.isArray(area.paths) ? area.paths.filter((p) => typeof p === "string") : [],
+        rationale: typeof area.rationale === "string" ? area.rationale.trim() : undefined,
+      });
+      if (normalized.length >= maxAreas) break;
+    }
+
+    if (normalized.length === 0) {
+      normalized.push({
+        id: "general",
+        title: "General",
+        focus: "Overall implementation and spec coverage",
+        paths: [],
+      });
+    }
+
+    return normalized;
+  }
+
+  private async runCodexSpecAuditPlan(
+    maxAreas: number,
+    repoSummary: string
+  ): Promise<SpecAuditPlan> {
+    const nonce = randomUUID();
+    const prompt = this.buildSpecAuditPlanPrompt(maxAreas, repoSummary, nonce);
+    const output = await this.execCodexPrompt(prompt, "audit-plan", this.cfg.specAuditModel ?? this.cfg.codexModel);
+    const json = this.extractCodexJson(output, "CODEX_AUDIT_PLAN", nonce);
+    return JSON.parse(json) as SpecAuditPlan;
+  }
+
+  private async runCodexSpecAuditArea(
+    area: SpecAuditPlanArea,
+    repoSummary: string
+  ): Promise<SpecAuditAreaResult> {
+    const nonce = randomUUID();
+    const prompt = this.buildSpecAuditAreaPrompt(area, repoSummary, nonce);
+    const output = await this.execCodexPrompt(
+      prompt,
+      `audit-area:${area.id}`,
+      this.cfg.specAuditModel ?? this.cfg.codexModel
+    );
+    const json = this.extractCodexJson(output, "CODEX_AUDIT_AREA", nonce);
+    return JSON.parse(json) as SpecAuditAreaResult;
+  }
+
+  private async runCodexSpecAuditSynthesis(
+    plan: SpecAuditPlan,
+    areas: SpecAuditPlanArea[],
+    areaResults: SpecAuditAreaResult[],
+    taskListRaw: string,
+    repoSummary: string
+  ): Promise<SpecAuditSynthesis> {
+    const nonce = randomUUID();
+    const prompt = this.buildSpecAuditSynthesisPrompt(
+      plan,
+      areas,
+      areaResults,
+      taskListRaw,
+      repoSummary,
+      nonce
+    );
+    const output = await this.execCodexPrompt(
+      prompt,
+      "audit-synthesis",
+      this.cfg.specAuditModel ?? this.cfg.codexModel
+    );
+    const json = this.extractCodexJson(output, "CODEX_AUDIT_SYNTHESIS", nonce);
+    return JSON.parse(json) as SpecAuditSynthesis;
+  }
+
+  private async applySpecAuditResults(
+    synthesis: SpecAuditSynthesis,
+    areaCount: number
+  ): Promise<{ addedTasks: number; reopenedTasks: number }> {
+    const taskList = await this.readTaskList();
+    const existingIds = new Set(taskList.map((task) => task.id));
+    const reopened = new Set<string>();
+    let reopenedTasks = 0;
+    let addedTasks = 0;
+
+    for (const reopen of synthesis.reopen_tasks ?? []) {
+      if (!reopen || typeof reopen.id !== "string") continue;
+      const id = reopen.id.trim();
+      if (!id || reopened.has(id)) continue;
+      const entry = taskList.find((task) => task.id === id);
+      if (!entry) continue;
+      if (entry.passes !== false) {
+        entry.passes = false;
+        reopenedTasks += 1;
+      }
+      reopened.add(id);
+    }
+
+    const newTasks = Array.isArray(synthesis.new_tasks) ? synthesis.new_tasks : [];
+    for (const rawTask of newTasks) {
+      const normalized = this.normalizeNewTask(rawTask);
+      if (!normalized) continue;
+      let id = normalized.id;
+      if (existingIds.has(id)) {
+        let suffix = 2;
+        while (existingIds.has(`${id}-${suffix}`)) suffix += 1;
+        id = `${id}-${suffix}`;
+      }
+      normalized.id = id;
+      normalized.passes = false;
+      taskList.push(normalized);
+      existingIds.add(id);
+      addedTasks += 1;
+    }
+
+    const summaryBits = [
+      synthesis.result ? synthesis.result.toUpperCase() : "UNKNOWN",
+      `${areaCount} area(s)`,
+      `${addedTasks} new`,
+      `${reopenedTasks} reopened`,
+    ];
+    const progressEntry = `[${new Date().toISOString()}] Spec audit (codex): ${summaryBits.join(", ")}.\n`;
+
+    await fs.writeFile(this.paths.taskList, JSON.stringify(taskList, null, 2) + "\n");
+    await fs.appendFile(this.paths.progressLog, progressEntry, "utf8");
+
+    const env = this.buildGitEnv();
+    await this.ensureGitIdentity(env);
+    await execFileAsync("git", ["-C", this.workingDir, "add", "task_list.json", "claude-progress.txt"], { env });
+
+    const status = await execFileAsync("git", ["-C", this.workingDir, "status", "--porcelain"], { env });
+    if (status.stdout.trim()) {
+      const message = `Spec audit: ${addedTasks} new, ${reopenedTasks} reopened`;
+      await execFileAsync("git", ["-C", this.workingDir, "commit", "-m", message], { env });
+    }
+
+    return { addedTasks, reopenedTasks };
+  }
+
+  private normalizeNewTask(raw: TaskSpec | undefined): TaskSpec | null {
+    if (!raw || typeof raw !== "object") return null;
+    const id = typeof raw.id === "string" ? this.normalizeTaskId(raw.id) : "";
+    const description = typeof raw.description === "string" ? raw.description.trim() : "";
+    const category = typeof raw.category === "string" ? raw.category.trim() : "audit";
+    const steps = Array.isArray(raw.steps)
+      ? raw.steps.filter((step) => typeof step === "string" && step.trim().length > 0)
+      : [];
+    if (!id || !description || steps.length === 0) return null;
+
+    const depends_on = Array.isArray(raw.depends_on)
+      ? raw.depends_on.filter((dep) => typeof dep === "string" && dep.trim().length > 0)
+      : undefined;
+    const scope = Array.isArray(raw.scope)
+      ? raw.scope.filter((entry) => typeof entry === "string" && entry.trim().length > 0)
+      : undefined;
+
+    return {
+      id,
+      category,
+      description,
+      steps,
+      depends_on,
+      scope,
+    };
+  }
+
+  private normalizeTaskId(value: string): string {
+    return value
+      .trim()
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, "-")
+      .replace(/^-+|-+$/g, "")
+      .replace(/-+/g, "-");
+  }
+
+  private extractCodexJson(output: string, marker: string, nonce: string): string {
+    const pattern = new RegExp(
+      `<<<${marker}:${nonce}>>>\\s*([\\s\\S]*?)\\s*<<<END_${marker}:${nonce}>>>`,
+      "g"
+    );
+    const matches = [...output.matchAll(pattern)];
+    if (matches.length === 0) {
+      throw new Error(`Failed to parse Codex output for ${marker}`);
+    }
+    const last = matches[matches.length - 1];
+    return (last?.[1] ?? "").trim();
+  }
+
+  private async execCodexPrompt(prompt: string, label: string, model?: string): Promise<string> {
+    log("audit", `Running Codex CLI (${label})...`);
+    const args = ["exec"];
+    if (model) {
+      args.push("-m", model);
+    }
+    args.push("--dangerously-bypass-approvals-and-sandbox", "--skip-git-repo-check", prompt);
+
+    return new Promise((resolve, reject) => {
+      const proc = spawn("codex", args, {
+        cwd: this.workingDir,
+        env: {
+          ...process.env,
+          GIT_DIR: path.join(this.workingDir, ".git"),
+        },
+        stdio: ["pipe", "pipe", "pipe"],
+      });
+
+      let stdout = "";
+      let stderr = "";
+
+      proc.stdout.on("data", (data: Buffer) => {
+        stdout += data.toString();
+      });
+
+      proc.stderr.on("data", (data: Buffer) => {
+        stderr += data.toString();
+      });
+
+      proc.on("close", (code) => {
+        if (code !== 0) {
+          log("audit", `Codex CLI exited with code ${code} (${label}).`);
+        } else {
+          log("audit", `Codex CLI completed (${label}).`);
+        }
+        resolve(stdout + stderr);
+      });
+
+      proc.on("error", (err) => {
+        reject(new Error(`Codex CLI spawn failed (${label}): ${err.message}`));
+      });
+    });
+  }
+
+  private buildSpecAuditPlanPrompt(
+    maxAreas: number,
+    repoSummary: string,
+    nonce: string
+  ): string {
+    return `You are setting up a spec audit for a Looper-managed project.
+
+Project spec:
+---
+${this.cfg.projectSpec.trim()}
+---
+
+${repoSummary}
+
+Your job: decide how many reviewers (1-${maxAreas}) are needed and define
+non-overlapping functional areas to audit. Use fewer areas for small codebases.
+If you need more context, inspect the repo (git ls-files, rg, ls).
+
+Return ONLY valid JSON between the markers, with this shape:
+{
+  "areas": [
+    {
+      "id": "kebab-case-id",
+      "title": "Area name",
+      "focus": "What to review in this area",
+      "paths": ["optional/path", "optional/glob"],
+      "rationale": "why this area matters"
+    }
+  ],
+  "notes": ["optional notes"]
+}
+
+<<<CODEX_AUDIT_PLAN:${nonce}>>>
+<json>
+<<<END_CODEX_AUDIT_PLAN:${nonce}>>>`;
+  }
+
+  private buildSpecAuditAreaPrompt(
+    area: SpecAuditPlanArea,
+    repoSummary: string,
+    nonce: string
+  ): string {
+    const paths = (area.paths ?? []).join(", ");
+    return `You are a SPEC AUDITOR for a Looper-managed project.
+
+Project spec:
+---
+${this.cfg.projectSpec.trim()}
+---
+
+${repoSummary}
+
+Area ID: ${area.id}
+Area title: ${area.title}
+Area focus: ${area.focus}
+Relevant paths: ${paths || "(none specified)"}
+
+Audit this area against the spec. Look for missing behavior, incorrect behavior,
+or untested/untested-critical paths. If you need more context, inspect the repo.
+Do NOT modify any files.
+
+Return ONLY valid JSON between the markers:
+{
+  "area_id": "${area.id}",
+  "status": "PASS" | "FAIL",
+  "summary": "short summary",
+  "issues": [
+    {
+      "issue": "what is missing or wrong",
+      "evidence": "file:line or command output",
+      "severity": "high|medium|low",
+      "spec_ref": "spec section or quote"
+    }
+  ],
+  "notes": ["optional notes"]
+}
+
+<<<CODEX_AUDIT_AREA:${nonce}>>>
+<json>
+<<<END_CODEX_AUDIT_AREA:${nonce}>>>`;
+  }
+
+  private buildSpecAuditSynthesisPrompt(
+    plan: SpecAuditPlan,
+    areas: SpecAuditPlanArea[],
+    areaResults: SpecAuditAreaResult[],
+    taskListRaw: string,
+    repoSummary: string,
+    nonce: string
+  ): string {
+    return `You are synthesizing a spec audit for a Looper-managed project.
+
+Project spec:
+---
+${this.cfg.projectSpec.trim()}
+---
+
+${repoSummary}
+
+Audit plan:
+${JSON.stringify(plan, null, 2)}
+
+Audit areas:
+${JSON.stringify(areas, null, 2)}
+
+Area results:
+${JSON.stringify(areaResults, null, 2)}
+
+Existing task_list.json:
+${taskListRaw}
+
+Your job: turn findings into actionable tasks.
+- If gaps are found, output new tasks or reopen existing ones.
+- Avoid duplicate tasks; if an existing task should be revisited, list it in reopen_tasks.
+- Ensure any new task id is unique within task_list.json; if it already exists, reopen it or pick a new id.
+- If everything is covered, return PASS with empty arrays.
+
+Return ONLY valid JSON between the markers:
+{
+  "result": "PASS" | "FAIL",
+  "new_tasks": [
+    {
+      "id": "kebab-case-id",
+      "category": "functional|api|ui|infra|test|security|performance|docs|audit",
+      "description": "one sentence",
+      "steps": ["manual verification step 1", "step 2"],
+      "depends_on": ["optional-task-id"],
+      "scope": ["optional/path"]
+    }
+  ],
+  "reopen_tasks": [
+    {
+      "id": "existing-task-id",
+      "reason": "why it must be reopened"
+    }
+  ],
+  "summary": ["brief notes for humans"]
+}
+
+<<<CODEX_AUDIT_SYNTHESIS:${nonce}>>>
+<json>
+<<<END_CODEX_AUDIT_SYNTHESIS:${nonce}>>>`;
+  }
+
+  private buildSpecAuditClaudePrompt(): string {
+    return `You are running a spec audit for a Looper-managed project.
+
+Project spec:
+---
+${this.cfg.projectSpec.trim()}
+---
+
+Your job:
+- Verify the repo matches the spec.
+- Run relevant checks (init.sh, tests) when available.
+- If gaps exist, add new tasks to task_list.json or reopen existing tasks.
+- If everything matches the spec, do not add tasks.
+
+STRICT RULES:
+- Do NOT change product code. Only update task_list.json and claude-progress.txt.
+- Be concrete: each task must have clear steps to verify.
+- Avoid duplicates; reuse/reopen existing tasks when appropriate.
+- Ensure any new task id is unique within task_list.json; if it collides, reopen or choose a new id.
+
+At the end:
+- Append a brief entry to claude-progress.txt summarizing the audit.
+- Commit changes with a message like "Spec audit: <brief summary>".
+`;
   }
 
   /**
@@ -670,11 +1428,12 @@ export class LongRunningHarness {
   private async runReviewAgent(
     task: TaskSpec,
     options: Options,
-    existingSessionId: string | null
+    existingSessionId: string | null,
+    workerMode: boolean
   ): Promise<ReviewResult> {
     const reviewPrompt = existingSessionId
-      ? this.buildReviewContinuationPrompt(task)
-      : this.buildReviewPrompt(task);
+      ? (workerMode ? this.buildReviewContinuationPromptForWorker(task) : this.buildReviewContinuationPrompt(task))
+      : (workerMode ? this.buildReviewPromptForWorker(task) : this.buildReviewPrompt(task));
 
     const reviewOptions: Options = {
       ...options,
@@ -780,17 +1539,29 @@ export class LongRunningHarness {
     }
 
     // No explicit markers - look for problem indicators
-    const problemIndicators = [
-      /\#\[ignore\]/i,
-      /stub|placeholder|todo|fixme/i,
-      /not actually (test|run|verify)/i,
-      /tests? (are |were )?ignored/i,
-      /--no-run/i,
-    ];
-
-    for (const pattern of problemIndicators) {
-      if (pattern.test(text)) {
-        return { passed: false, issues: ["Review found potential issues (no explicit PASS)"] };
+    // Use custom patterns if provided, otherwise use defaults
+    const customPatterns = this.cfg.prompts?.redFlagPatterns;
+    if (customPatterns !== undefined) {
+      // Custom patterns provided (may be empty array to disable detection)
+      for (const patternStr of customPatterns) {
+        const pattern = new RegExp(patternStr, "i");
+        if (pattern.test(text)) {
+          return { passed: false, issues: ["Review found potential issues (no explicit PASS)"] };
+        }
+      }
+    } else {
+      // Default code-focused patterns
+      const defaultIndicators = [
+        /\#\[ignore\]/i,
+        /stub|placeholder|todo|fixme/i,
+        /not actually (test|run|verify)/i,
+        /tests? (are |were )?ignored/i,
+        /--no-run/i,
+      ];
+      for (const pattern of defaultIndicators) {
+        if (pattern.test(text)) {
+          return { passed: false, issues: ["Review found potential issues (no explicit PASS)"] };
+        }
       }
     }
 
@@ -855,12 +1626,13 @@ export class LongRunningHarness {
    */
   private async runCodexReview(
     task: TaskSpec,
-    isRerun: boolean
+    isRerun: boolean,
+    workerMode: boolean
   ): Promise<ReviewResult> {
     const reviewNonce = randomUUID();
     const prompt = isRerun
-      ? this.buildCodexReviewContinuationPrompt(task, reviewNonce)
-      : this.buildCodexReviewPrompt(task, reviewNonce);
+      ? this.buildCodexReviewContinuationPrompt(task, reviewNonce, workerMode)
+      : this.buildCodexReviewPrompt(task, reviewNonce, workerMode);
 
     const model = this.cfg.codexModel;
     log("Harness", `Running Codex CLI review (model=${model ?? "default"}, task=${task.id})`);
@@ -952,7 +1724,10 @@ export class LongRunningHarness {
   /**
    * Build the Codex review prompt for initial review.
    */
-  private buildCodexReviewPrompt(task: TaskSpec, reviewNonce: string): string {
+  private buildCodexReviewPrompt(task: TaskSpec, reviewNonce: string, workerMode: boolean): string {
+    const coordinationNote = workerMode
+      ? "Do NOT update task_list.json or claude-progress.txt. The controller handles coordination."
+      : "If PASS, you must update task_list.json and claude-progress.txt as described below.";
     return `You are a CODE REVIEWER auditing work on task: "${task.id}"
 
 Task description: ${task.description}
@@ -973,7 +1748,9 @@ REVIEW GUIDELINES:
 - Fix minor issues yourself (typos, imports) rather than failing
 - Only re-run tests if code looks suspicious
 
-${this.buildCodexReviewOutputFormat(task.id, reviewNonce)}
+${coordinationNote}
+
+${this.buildCodexReviewOutputFormat(task.id, reviewNonce, workerMode)}
 
 Begin your audit now.`;
   }
@@ -981,7 +1758,10 @@ Begin your audit now.`;
   /**
    * Build the Codex review prompt for re-review after fixes.
    */
-  private buildCodexReviewContinuationPrompt(task: TaskSpec, reviewNonce: string): string {
+  private buildCodexReviewContinuationPrompt(task: TaskSpec, reviewNonce: string, workerMode: boolean): string {
+    const coordinationNote = workerMode
+      ? "Do NOT update task_list.json or claude-progress.txt. The controller handles coordination."
+      : "If PASS, you must update task_list.json and claude-progress.txt as described below.";
     return `The working agent claims to have fixed the issues you identified for task "${task.id}".
 
 IMPORTANT: Changes are UNCOMMITTED. Check staged/unstaged changes, not commits.
@@ -993,10 +1773,22 @@ Re-verify:
 
 Same guidelines: trust tests ran, fix minor issues yourself, only re-run if suspicious.
 
-${this.buildCodexReviewOutputFormat(task.id, reviewNonce)}`;
+${coordinationNote}
+
+${this.buildCodexReviewOutputFormat(task.id, reviewNonce, workerMode)}`;
   }
 
-  private buildCodexReviewOutputFormat(taskId: string, reviewNonce: string): string {
+  private buildCodexReviewOutputFormat(taskId: string, reviewNonce: string, workerMode: boolean): string {
+    const passActions = workerMode
+      ? `If PASS, you MUST:
+1. Do NOT edit task_list.json or claude-progress.txt
+2. Stage ALL changes: git add -A
+3. Commit code changes with message: "Task ${taskId}: <brief description>"`
+      : `If PASS, you MUST:
+1. Update task_list.json: set "passes": true for "${taskId}"
+2. Append to claude-progress.txt with a brief entry
+3. Stage ALL changes: git add -A
+4. Commit with message: "Complete ${taskId}: <brief description>"`;
     return `OUTPUT FORMAT (MACHINE READABLE ONLY):
 
 Return EXACTLY one block with valid JSON between the markers. Do not include any other text.
@@ -1005,11 +1797,7 @@ Return EXACTLY one block with valid JSON between the markers. Do not include any
 {"result":"<PASS|FAIL>","issues":["<issue with file:line reference>"],"verified":["<what you verified>"],"tests":["<tests you ran>"]}
 <<<END_CODEX_REVIEW_RESULT:${reviewNonce}>>>
 
-If PASS, you MUST:
-1. Update task_list.json: set "passes": true for "${taskId}"
-2. Append to claude-progress.txt with a brief entry
-3. Stage ALL changes: git add -A
-4. Commit with message: "Complete ${taskId}: <brief description>"`;
+${passActions}`;
   }
 
   /**
@@ -1075,14 +1863,19 @@ If PASS, you MUST:
     await this.execGit(["-C", this.workingDir, "remote", "set-url", "origin", authUrl], env);
     try {
       await this.execGit(["-C", this.workingDir, "fetch", "origin", branchRef], env);
-      await this.execGit(["-C", this.workingDir, "checkout", branchRef], env);
+      await this.execGit(["-C", this.workingDir, "checkout", "-B", branchRef, `origin/${branchRef}`], env);
       await this.execGit(["-C", this.workingDir, "reset", "--hard", `origin/${branchRef}`], env);
       await this.execGit(["-C", this.workingDir, "clean", "-fd"], env);
       log("Harness", `✓ Synced to origin/${branchRef}`);
     } catch (err: any) {
       const msg = err?.message ?? "";
       // Handle case where remote branch doesn't exist yet (empty repo)
-      if (msg.includes("couldn't find remote ref")) {
+      if (
+        msg.includes("couldn't find remote ref") ||
+        msg.includes("unknown revision") ||
+        msg.includes("not a commit") ||
+        msg.includes("pathspec")
+      ) {
         log("Harness", "Remote branch doesn't exist yet, using local state...");
       } else {
         throw err;
@@ -1374,6 +2167,14 @@ or stub implementations. Be skeptical. Work on branch ${this.branch}.
 ${envInfo}`;
     }
 
+    if (phase === "audit") {
+      return `You are a SPEC AUDITOR for a Looper-managed project.
+Your job is to check whether the implementation matches the project spec.
+Only update coordination artifacts (task_list.json, claude-progress.txt).
+Do NOT change product code. Work on branch ${this.branch}.
+${envInfo}`;
+    }
+
     return `You are a WORKING agent for a Looper-managed project.
 Your job is to pick up where previous agents left off, implement one task
 at a time, and verify it thoroughly. Work on branch ${this.branch}.
@@ -1424,12 +2225,14 @@ In this session you must:
          ],
          "passes": false
        }
-   - For EVERY other requirement in the spec, create a task object with:
-       - "id": short, stable identifier (kebab-case)
-       - "category": e.g. "functional", "ui", "api", "infrastructure", "performance", "security"
-       - "description": one-sentence behavior description
-       - "steps": ordered list of manual test steps a human can follow to verify it works
-       - "passes": false (always false initially)
+  - For EVERY other requirement in the spec, create a task object with:
+      - "id": short, stable identifier (kebab-case)
+      - "category": e.g. "functional", "ui", "api", "infrastructure", "performance", "security"
+      - "description": one-sentence behavior description
+      - "steps": ordered list of manual test steps a human can follow to verify it works
+      - "passes": false (always false initially)
+      - "depends_on": optional list of prerequisite task ids (be explicit when tasks can run in parallel)
+      - "scope": optional list of paths or areas this task is likely to touch (for conflict avoidance)
    - Be EXHAUSTIVE. Every task, behavior, and capability in the spec must have
      a corresponding entry. If the spec mentions it, there should be a task for it.
    - Include both happy paths AND error cases where the spec implies them.
@@ -1586,13 +2389,17 @@ ${isProjectSetup ? "4" : "5"}) Clean up AI-generated patterns ("deslop")
        - Any other style inconsistencies with the surrounding code.
    - The goal is code that looks like a skilled human wrote it, not an AI.
 
-${isProjectSetup ? "5" : "6"}) Test like a real user
-   - Exercise the full user flow described by that task's "steps".
+${isProjectSetup ? "5" : "6"}) Verify your work
+${this.cfg.prompts?.verificationCriteria ?? `   - Exercise the full user flow described by that task's "steps".
    - Use browser automation or HTTP calls if the tools are available, and
      complement them with unit or integration tests where helpful.
-   - Fix any bugs you find and re-run tests as needed.
+   - Fix any bugs you find and re-run tests as needed.`}
 
-${isProjectSetup ? "6" : "7"}) Update coordination artifacts ONLY when the task truly works
+${this.cfg.prompts?.completionCriteria ? `
+${isProjectSetup ? "6" : "7"}) Additional completion criteria
+${this.cfg.prompts.completionCriteria}
+
+${isProjectSetup ? "7" : "8"}) Update coordination artifacts ONLY when the task truly works` : `${isProjectSetup ? "6" : "7"}) Update coordination artifacts ONLY when the task truly works`}
    - In task_list.json:
        - Set "passes": true for the completed task.
        - Do NOT edit "category", "description", or "steps" unless you are fixing an objectively incorrect test (e.g., the product requirements changed).
@@ -1624,6 +2431,7 @@ Important constraints:
   investigation task and move on. Don't abandon libraries for hacky workarounds.
 - If you discover missing features/prerequisites: fix them now if feasible, otherwise
   add them as new tasks in task_list.json with "passes": false and move on.
+  Ensure new task ids do not collide with existing ones; reopen or rename if needed.
 - Do NOT redefine task requirements to claim success:
     * "Identical failures" is NOT "identical behavior" - things must actually work
     * If a task says "produce and consume records", records must actually be produced and consumed
@@ -1667,6 +2475,62 @@ DO:
   }
 
   /**
+   * Build the working prompt for parallel worker + review mode.
+   * The worker must implement without touching coordination artifacts.
+   */
+  private buildWorkingPromptForWorkerReview(isProjectSetup: boolean, task: TaskSpec): string {
+    const basePrompt = this.buildWorkingPrompt(isProjectSetup, task);
+
+    return `${basePrompt}
+
+═══════════════════════════════════════════════════════════════════════════════
+CRITICAL OVERRIDE - PARALLEL WORKER REVIEW MODE
+═══════════════════════════════════════════════════════════════════════════════
+You are running as a parallel worker with review enabled.
+The controller handles coordination artifacts and final task completion.
+
+DO NOT:
+- Update task_list.json to set "passes": true
+- Write to claude-progress.txt
+- Modify or reformat coordination artifacts
+- Run "git commit" or "git push" (leave changes UNCOMMITTED)
+
+DO:
+- Implement the task fully
+- Run tests and verify they pass
+- Stage your changes with "git add -A"
+- Leave the commit to the review agent
+═══════════════════════════════════════════════════════════════════════════════`;
+  }
+
+  /**
+   * Build the working prompt for parallel worker mode.
+   * The worker must implement and commit code but must NOT update coordination artifacts.
+   */
+  private buildWorkingPromptForWorker(isProjectSetup: boolean, task: TaskSpec): string {
+    const basePrompt = this.buildWorkingPrompt(isProjectSetup, task);
+
+    return `${basePrompt}
+
+═══════════════════════════════════════════════════════════════════════════════
+CRITICAL OVERRIDE - PARALLEL WORKER MODE
+═══════════════════════════════════════════════════════════════════════════════
+You are running as a parallel worker. The controller will update coordination
+artifacts and mark tasks complete.
+
+DO NOT:
+- Update task_list.json to set "passes": true
+- Write to claude-progress.txt
+- Modify or reformat coordination artifacts
+
+DO:
+- Implement the task fully
+- Run tests and verify they pass
+- Commit your code changes with a focused message
+═══════════════════════════════════════════════════════════════════════════════`;
+  }
+
+  /**
    * Prompt for fixing issues found by the review agent.
    */
   private buildFixPrompt(issues: string[], issuesPath?: string | null): string {
@@ -1699,6 +2563,7 @@ Rules:
 
 If you discover missing prerequisites: fix them now if feasible, otherwise add them
 as new tasks with "passes": false and move on to something you can complete.
+Ensure new task ids do not collide with existing ones; reopen or rename if needed.
 
 After completing your work:
 - Stage your changes with "git add" but DO NOT COMMIT
@@ -1707,9 +2572,67 @@ After completing your work:
   }
 
   /**
+   * Prompt for fixing issues in parallel worker + review mode.
+   */
+  private buildFixPromptForWorker(issues: string[], issuesPath?: string | null): string {
+    const basePrompt = this.buildFixPrompt(issues, issuesPath);
+    return `${basePrompt}
+
+Additional constraints for parallel worker review mode:
+- Do NOT update task_list.json or claude-progress.txt
+- Do NOT create new coordination tasks in task_list.json; report blockers in your response instead
+- Leave changes staged but UNCOMMITTED for the review agent
+`;
+  }
+
+  /**
    * Prompt for the review agent (fresh context, adversarial).
    */
   private buildReviewPrompt(task: TaskSpec): string {
+    const customChecklist = this.cfg.prompts?.reviewChecklist;
+
+    if (customChecklist) {
+      // Use custom domain-specific review prompt
+      return `
+You are an independent REVIEWER auditing work on task: "${task.id}"
+
+Task description: ${task.description}
+
+You have NO context of how this was done. You must verify independently.
+
+IMPORTANT: The working agent has left changes UNCOMMITTED for you to review.
+You will see staged/unstaged changes, not commits.
+
+YOUR JOB IS TO FIND PROBLEMS. Be skeptical.
+
+${customChecklist}
+
+OUTPUT FORMAT (you MUST use this exact format at the end):
+
+If issues found:
+REVIEW_RESULT: FAIL
+ISSUES:
+- <issue 1 with reference>
+- <issue 2 with reference>
+...
+
+If everything passes:
+REVIEW_RESULT: PASS
+VERIFIED:
+- <what you verified>
+
+Then, if PASS, you MUST do ALL of the following in ONE ATOMIC COMMIT:
+1. Update task_list.json: set "passes": true for "${task.id}"
+2. Append to claude-progress.txt with a brief entry noting the task was reviewed and approved
+3. Stage ALL changes: git add -A
+4. Commit EVERYTHING together with message:
+   "Complete ${task.id}: <brief description>"
+
+Begin your review now.
+`;
+    }
+
+    // Default code-focused review prompt
     return `
 You are an independent CODE REVIEWER auditing work on task: "${task.id}"
 
@@ -1794,6 +2717,133 @@ Begin your audit now.
   }
 
   /**
+   * Prompt for the review agent in parallel worker mode (no coordination updates).
+   */
+  private buildReviewPromptForWorker(task: TaskSpec): string {
+    const customChecklist = this.cfg.prompts?.reviewChecklist;
+
+    if (customChecklist) {
+      return `
+You are an independent REVIEWER auditing work on task: "${task.id}"
+
+Task description: ${task.description}
+
+You have NO context of how this was done. You must verify independently.
+
+IMPORTANT: The working agent has left changes UNCOMMITTED for you to review.
+You will see staged/unstaged changes, not commits.
+
+YOUR JOB IS TO FIND PROBLEMS. Be skeptical.
+
+${customChecklist}
+
+OUTPUT FORMAT (you MUST use this exact format at the end):
+
+If issues found:
+REVIEW_RESULT: FAIL
+ISSUES:
+- <issue 1 with reference>
+- <issue 2 with reference>
+...
+
+If everything passes:
+REVIEW_RESULT: PASS
+VERIFIED:
+- <what you verified>
+
+Then, if PASS, you MUST do ALL of the following in ONE ATOMIC COMMIT:
+1. Do NOT update task_list.json or claude-progress.txt (controller handles it)
+2. Stage ALL changes: git add -A
+3. Commit code changes with message:
+   "Task ${task.id}: <brief description>"
+
+Begin your review now.
+`;
+    }
+
+    return `
+You are an independent CODE REVIEWER auditing work on task: "${task.id}"
+
+Task description: ${task.description}
+
+You have NO context of how this was implemented. You must verify independently.
+
+IMPORTANT: The working agent has left changes UNCOMMITTED for you to review.
+You will see staged/unstaged changes, not commits.
+
+YOUR JOB IS TO FIND PROBLEMS. Be skeptical. Assume the implementation may be:
+- Incomplete (stubs, placeholders, TODOs left in code)
+- Untested (tests don't actually run, are ignored, or don't verify behavior)
+- Gaming metrics (marking things complete without real verification)
+
+AUDIT CHECKLIST:
+
+1. Check what changed (the working agent left changes uncommitted):
+   - Run: git status
+   - Run: git diff --stat
+   - Run: git diff (for unstaged) and git diff --cached (for staged)
+
+2. Look for cheating patterns:
+   - Run: grep -r "#\\[ignore\\]" on test files (tests that are skipped)
+   - Run: grep -r "TODO\\|FIXME\\|unimplemented\\|todo!" on changed files
+   - Check if tests use "--no-run" (compilation only, no execution)
+
+3. Actually run the tests:
+   - Find and run the relevant test command (cargo test, npm test, pytest, etc.)
+   - Verify tests ACTUALLY EXECUTE (not just compile)
+   - Check the output shows tests running and passing
+
+4. Verify the implementation:
+   - Does the code actually do what the task description says?
+   - Are there stub/placeholder implementations?
+   - Is error handling real or just "// TODO: handle errors"?
+
+5. Check for deferred work:
+   - "Ready to run" but never actually run
+   - "Infrastructure complete" but no actual functionality
+   - Tests that test infrastructure, not behavior
+
+RED FLAGS (automatic fail):
+- Tests marked #[ignore] that should run
+- "cargo test --no-run" used as verification
+- Stub implementations (unimplemented!(), todo!(), pass, ...)
+- TODOs in the implementation code
+- Tests that don't assert anything meaningful
+- "This will be implemented later" comments
+- Abandoning proper libraries for manual implementations without justification
+  (e.g., "had version issues" so switched to manual byte encoding)
+- Using old/deprecated API versions when modern ones should work
+- Redefining task requirements to claim success (e.g., "identical failures count as identical behavior")
+- Rationalizing that broken code meets requirements through creative interpretation
+
+OUTPUT FORMAT (you MUST use this exact format at the end):
+
+If issues found:
+REVIEW_RESULT: FAIL
+ISSUES:
+- <issue 1 with file:line reference>
+- <issue 2 with file:line reference>
+...
+
+If everything passes:
+REVIEW_RESULT: PASS
+VERIFIED:
+- <what you verified>
+- <tests you ran and their output>
+
+Then, if PASS, you MUST do ALL of the following in ONE ATOMIC COMMIT:
+1. Do NOT update task_list.json or claude-progress.txt (controller handles it)
+2. Stage ALL changes: git add -A
+3. Commit code changes with message:
+   "Task ${task.id}: <brief description of what was implemented>"
+
+This ensures the implementation is committed for the controller to merge.
+
+Begin your audit now.
+`;
+  }
+
+  /**
    * Prompt for continuing a review session after fixes.
    */
   private buildReviewContinuationPrompt(task: TaskSpec): string {
@@ -1832,6 +2882,44 @@ If PASS, you MUST do ALL of the following in ONE ATOMIC COMMIT:
 `;
   }
 
+  /**
+   * Prompt for continuing a review session after fixes (parallel worker mode).
+   */
+  private buildReviewContinuationPromptForWorker(task: TaskSpec): string {
+    return `
+The working agent claims to have fixed the issues you identified.
+
+IMPORTANT: Changes are UNCOMMITTED. Check staged/unstaged changes, not commits.
+
+Re-verify:
+1. Run: git status and git diff to see current changes
+2. Check if each issue you raised has been addressed
+3. Run the tests again to confirm they pass
+4. Look for any NEW issues introduced by the fixes
+
+Be thorough. Don't just trust claims - verify independently.
+
+OUTPUT FORMAT:
+
+If issues remain or new issues found:
+REVIEW_RESULT: FAIL
+ISSUES:
+- <remaining/new issue with file:line reference>
+...
+
+If ALL issues are fixed:
+REVIEW_RESULT: PASS
+VERIFIED:
+- <what you verified>
+
+If PASS, you MUST do ALL of the following in ONE ATOMIC COMMIT:
+1. Do NOT update task_list.json or claude-progress.txt (controller handles it)
+2. Stage ALL changes: git add -A
+3. Commit code changes with message:
+   "Task ${task.id}: <brief description>"
+`;
+  }
+
   private async isTaskListValid(): Promise<boolean> {
     try {
       await this.readTaskList();
@@ -1842,7 +2930,7 @@ If PASS, you MUST do ALL of the following in ONE ATOMIC COMMIT:
     }
   }
 
-  private async readTaskList(): Promise<TaskList> {
+  public async readTaskList(): Promise<TaskList> {
     const raw = await fs.readFile(this.paths.taskList, "utf8");
     const data = JSON.parse(raw);
 
@@ -1850,7 +2938,11 @@ If PASS, you MUST do ALL of the following in ONE ATOMIC COMMIT:
       throw new Error("task_list.json is not an array");
     }
 
-    return data.map((item, idx) => {
+    const normalized: TaskSpec[] = [];
+    const idCounts = new Map<string, number>();
+
+    for (let idx = 0; idx < data.length; idx++) {
+      const item = data[idx];
       if (!item || typeof item !== "object") {
         throw new Error(`task_list.json entry ${idx} is not an object`);
       }
@@ -1883,14 +2975,64 @@ If PASS, you MUST do ALL of the following in ONE ATOMIC COMMIT:
         throw new Error(`task_list.json entry ${idx} has an invalid "passes" flag (must be boolean)`);
       }
 
-      return {
+      if (record.depends_on !== undefined) {
+        if (!Array.isArray(record.depends_on)) {
+          throw new Error(`task_list.json entry ${idx} has invalid "depends_on" (must be array)`);
+        }
+        for (let i = 0; i < record.depends_on.length; i++) {
+          if (typeof record.depends_on[i] !== "string") {
+            throw new Error(`task_list.json entry ${idx} has non-string depends_on at index ${i}`);
+          }
+        }
+      }
+
+      if (record.scope !== undefined) {
+        if (!Array.isArray(record.scope)) {
+          throw new Error(`task_list.json entry ${idx} has invalid "scope" (must be array)`);
+        }
+        for (let i = 0; i < record.scope.length; i++) {
+          if (typeof record.scope[i] !== "string") {
+            throw new Error(`task_list.json entry ${idx} has non-string scope at index ${i}`);
+          }
+        }
+      }
+
+      const task: TaskSpec = {
         id: record.id,
         category: record.category,
         description: record.description,
         steps: record.steps as string[],
         passes: record.passes as boolean | undefined,
+        depends_on: record.depends_on as string[] | undefined,
+        scope: record.scope as string[] | undefined,
       };
-    });
+
+      normalized.push(task);
+      idCounts.set(task.id, (idCounts.get(task.id) ?? 0) + 1);
+    }
+
+    const duplicates = [...idCounts.entries()]
+      .filter(([, count]) => count > 1)
+      .map(([id]) => id);
+
+    if (duplicates.length === 0) {
+      return normalized;
+    }
+
+    console.warn(
+      `[Harness] Duplicate task ids detected; using last occurrence for: ${duplicates.join(", ")}`
+    );
+
+    const seen = new Set<string>();
+    const deduped: TaskSpec[] = [];
+    for (let i = normalized.length - 1; i >= 0; i--) {
+      const task = normalized[i];
+      if (seen.has(task.id)) continue;
+      seen.add(task.id);
+      deduped.push(task);
+    }
+    deduped.reverse();
+    return deduped;
   }
 
   /**
