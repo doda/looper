@@ -115,6 +115,8 @@ interface LongRunningHarnessConfig {
   workingDir?: string;           // Local directory (default: cwd)
   projectName?: string;          // Human-friendly name for prompts
   model?: string;                // "opus", "sonnet", etc.
+  primaryAgent?: "claude" | "codex"; // Primary agent for planning/working
+  enableReviewAgent?: boolean; // Enable review agent ping-pong flow
   branch?: string;               // Git branch (default: "main")
   gitToken?: string;             // GitHub token (default: GITHUB_TOKEN env)
   
@@ -127,10 +129,9 @@ interface LongRunningHarnessConfig {
   mcpServers?: Options["mcpServers"];
   sdkOptionsOverride?: Partial<Options>;
 
-  // Continuous spec audit
-  continuous?: boolean;          // Run Codex spec audit when tasks complete
+  // Continuous audit
+  continuous?: boolean;          // Run Codex audit when tasks complete
   specAuditMaxAreas?: number;    // Max audit areas (default: 10)
-  specAuditParallelism?: number; // Max parallel reviewers (default: 3)
   specAuditModel?: string;       // Codex model override for audit
 }
 ```
@@ -149,11 +150,12 @@ Options:
   --timeout <secs>         Timeout seconds (default: 3600)
   --repo-url <url>         GitHub repo URL
   --branch <branch>        Git branch (default: main)
-  --continuous             After tasks complete, run a Codex spec audit and continue if new tasks are added
+  --primary-agent <agent>  Primary agent: claude, codex (default: codex)
+  --continuous             After tasks complete, run a Codex audit and continue if new tasks are added
   --spec-audit-max-areas <n> Max audit areas/reviewers (default: 10)
-  --spec-audit-parallelism <n> Max parallel Codex reviewers (default: 3)
   --claude-oauth-file <f>  Path to Claude Code OAuth credentials JSON
                            (default: ./.claude-code-credentials.json)
+  --enable-review          Enable review agent ping-pong (default: off)
 ```
 
 ## Authentication
@@ -162,6 +164,8 @@ Looper supports two authentication methods for the Claude Agent SDK:
 
 1. **API Key** (traditional): Set `ANTHROPIC_API_KEY` environment variable
 2. **OAuth Credentials** (recommended for Claude Code): Place `.claude-code-credentials.json` in the repo root, or use `--claude-oauth-file` flag
+
+If you run with `--primary-agent codex`, Claude credentials are not required. Ensure Codex CLI auth is set up (run `codex auth login` on the host). Reviews are disabled by default; pass `--enable-review` to turn them on.
 
 The OAuth credentials file should contain JSON in this format:
 ```json

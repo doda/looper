@@ -13,6 +13,7 @@ GitHub is the canonical source of truth. Always start from the latest `origin/ma
 - Make small, reliable, end-to-end improvements
 - Keep the project in a clean, working state
 - Leave excellent breadcrumbs for the next agent via files and git logs
+- Fix any bugs encountered along the way
 
 ## Coordination Artifacts
 
@@ -92,4 +93,3 @@ When working on Looper itself:
 - **Run harness:** `npx tsx run.ts <project-name> --instruction "..."`
 - **Run tests:** `pnpm test`
 - **Type check:** `pnpm lint`
-

@@ -10,13 +10,28 @@ import {
   type SDKMessage,
 } from "@anthropic-ai/claude-agent-sdk";
 import { logDebug, logError, logInfo, logWarn } from "./logger.js";
+import { pathExists, summarizeValue, truncateText } from "./utils.js";
 
 const execFileAsync = promisify(execFile);
 
-/** Log with timestamp prefix */
-function log(prefix: string, message: string): void {
-  logInfo(prefix, message);
-}
+// ─────────────────────────────────────────────────────────────────────────────
+// Constants
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** Max consecutive session failures before stopping. */
+const MAX_CONSECUTIVE_FAILURES = 3;
+
+/** Default max review iterations in ping-pong flow. */
+const DEFAULT_MAX_REVIEW_ITERATIONS = 3;
+
+/** Default max turns for review agent sessions. */
+const DEFAULT_MAX_REVIEW_TURNS = 100;
+
+/** Default max turns for audit sessions. */
+const DEFAULT_MAX_AUDIT_TURNS = 60;
+
+/** Delay before retrying after a session failure. */
+const RETRY_DELAY_MS = 10_000;
 
 /**
  * Configuration for the long-running project harness.
@@ -44,6 +59,13 @@ export interface LongRunningHarnessConfig {
    * If omitted, the SDK default is used.
    */
   model?: string;
+
+  /**
+   * Primary agent for planning and working sessions.
+   * - "claude": Use Claude Agent SDK (default)
+   * - "codex": Use OpenAI Codex CLI
+   */
+  primaryAgent?: "claude" | "codex";
 
   /**
    * Max turns for the planning session.
@@ -129,24 +151,19 @@ export interface LongRunningHarnessConfig {
   codexModel?: string;
 
   /**
-   * Enable continuous mode: run a spec audit when all tasks are passing.
-   * The audit can add or reopen tasks, then the harness continues.
+   * Enable continuous mode: run an audit when all tasks are passing.
+   * The audit can add tasks, then the harness continues.
    */
   continuous?: boolean;
 
   /**
-   * Max number of spec audit areas (reviewers) for Codex CLI.
+   * Max number of audit areas (reviewers) for Codex CLI.
    * The model decides the actual number up to this cap.
    */
   specAuditMaxAreas?: number;
 
   /**
-   * Max parallel Codex reviewers during spec audit.
-   */
-  specAuditParallelism?: number;
-
-  /**
-   * Optional Codex model override for spec audit.
+   * Optional Codex model override for audit.
    * Defaults to codexModel when omitted.
    */
   specAuditModel?: string;
@@ -208,6 +225,7 @@ interface SpecAuditPlanArea {
   id: string;
   title: string;
   focus: string;
+  lens?: string;
   paths?: string[];
   rationale?: string;
 }
@@ -218,6 +236,19 @@ interface SpecAuditPlan {
 }
 
 interface SpecAuditIssue {
+  category?:
+    | "missing"
+    | "incorrect"
+    | "edge-case"
+    | "untested"
+    | "security"
+    | "bug"
+    | "refactor"
+    | "performance"
+    | "reliability"
+    | "observability"
+    | "docs"
+    | "ux";
   issue: string;
   evidence?: string;
   severity?: string;
@@ -232,15 +263,9 @@ interface SpecAuditAreaResult {
   notes?: string[];
 }
 
-interface SpecAuditReopen {
-  id: string;
-  reason?: string;
-}
-
 interface SpecAuditSynthesis {
   result: "PASS" | "FAIL";
   new_tasks?: TaskSpec[];
-  reopen_tasks?: SpecAuditReopen[];
   summary?: string[];
 }
 
@@ -251,12 +276,33 @@ interface SessionResult {
   errorSubtype?: string;
 }
 
+interface AutoCommitContext {
+  taskId?: string;
+  result?: "PASS" | "FAIL" | "ERROR";
+  reason?: string;
+}
+
 interface ReviewResult {
   sessionId: string | null;
   passed: boolean;
   issues: string[];
   issuesPath?: string | null;
 }
+
+interface CodexAgentResultPayload {
+  result?: string;
+  notes?: string[];
+  tests?: string[];
+}
+
+interface CodexAgentResult {
+  passed: boolean;
+  payload: CodexAgentResultPayload;
+  exitCode: number;
+  output: string;
+}
+
+type CodexLogMode = "summary" | "full" | "quiet";
 
 /**
  * LongRunningHarness implements a two-agent harness on top of the Claude Agent SDK:
@@ -296,6 +342,9 @@ export class LongRunningHarness {
     if (!cfg.repositoryUrl) {
       throw new Error("repositoryUrl is required for LongRunningHarness");
     }
+    if (cfg.primaryAgent === "codex" && cfg.reviewAgent === "claude") {
+      throw new Error("primaryAgent=codex cannot use reviewAgent=claude");
+    }
     this.workingDir = cfg.workingDir ?? process.cwd();
     this.branch = cfg.branch ?? "main";
     this.baseBranch = cfg.baseBranch ?? this.branch;
@@ -312,6 +361,26 @@ export class LongRunningHarness {
       initScript: path.join(this.workingDir, "init.sh"),
       gitDir: path.join(this.workingDir, ".git"),
     };
+  }
+
+  private getPrimaryAgent(): "claude" | "codex" {
+    return this.cfg.primaryAgent ?? "claude";
+  }
+
+  private getReviewAgent(): "claude" | "codex" {
+    return this.cfg.reviewAgent ?? "codex";
+  }
+
+  private isCodexPrimary(): boolean {
+    return this.getPrimaryAgent() === "codex";
+  }
+
+  private getCodexLogMode(): CodexLogMode {
+    const raw = process.env.LOOPER_CODEX_LOG_MODE?.toLowerCase();
+    if (raw === "full" || raw === "summary" || raw === "quiet") {
+      return raw;
+    }
+    return "summary";
   }
 
   /**
@@ -334,12 +403,12 @@ export class LongRunningHarness {
       const taskListValid = await this.isTaskListValid();
 
       if (taskListValid) {
-        log("Harness", "Project already initialized.");
+        logInfo("Harness", "Project already initialized.");
         return;
       }
     }
 
-    log("Harness", "Project not fully initialized; running planning agent…");
+    logInfo("Harness", "Project not fully initialized; running planning agent…");
     await this.runPlanningAgent();
   }
 
@@ -351,25 +420,32 @@ export class LongRunningHarness {
    * Returns true if session completed successfully, false if it failed.
    */
   async runWorkingSession(): Promise<boolean> {
-    log("Harness", "═══════════════════════════════════════════════════════════");
-    log("Harness", "Starting working session");
-    log("Harness", "═══════════════════════════════════════════════════════════");
+    logInfo("Harness", "═══════════════════════════════════════════════════════════");
+    logInfo("Harness", "Starting working session");
+    logInfo("Harness", "═══════════════════════════════════════════════════════════");
 
     await this.ensureInitialized();
 
     const remaining = await this.countRemainingTasks();
     if (remaining != null) {
-      log("Harness", `Remaining failing tasks: ${remaining}`);
+      logInfo("Harness", `Remaining failing tasks: ${remaining}`);
     }
 
     const nextTask = await this.getNextFailingTask();
     if (nextTask) {
-      log("Harness", `Next task to work on: ${nextTask.id} (${nextTask.category})`);
-      log("Harness", `  Description: ${nextTask.description}`);
+      logInfo("Harness", `Next task to work on: ${nextTask.id} (${nextTask.category})`);
+      logInfo("Harness", `  Description: ${nextTask.description}`);
     }
     const isProjectSetup = nextTask?.id === "project-setup";
     if (isProjectSetup) {
-      log("Harness", "This is project-setup (scaffolding phase)");
+      logInfo("Harness", "This is project-setup (scaffolding phase)");
+    }
+
+    if (this.isCodexPrimary()) {
+      if (this.cfg.enableReviewAgent && nextTask) {
+        return this.runCodexWorkingSessionWithReview(nextTask, isProjectSetup);
+      }
+      return this.runCodexWorkingSession(isProjectSetup, nextTask ?? undefined);
     }
 
     const options: Options = {
@@ -387,21 +463,48 @@ export class LongRunningHarness {
     }
 
     // Original flow without review agent
-    log("Harness", "Starting working agent session…");
+    logInfo("Harness", "Starting working agent session…");
+    const basePrompt = this.buildWorkingPrompt(isProjectSetup, nextTask ?? undefined);
     try {
-      await this.runQuery(this.buildWorkingPrompt(isProjectSetup, nextTask ?? undefined), options, "working");
-      log("Harness", "Working session complete, checking for commits to push...");
-      await this.pushIfNeeded("working");
-      log("Harness", "═══════════════════════════════════════════════════════════");
+      await this.runQuery(basePrompt, options, "working");
+      logInfo("Harness", "Working session complete, checking for commits to push...");
+      await this.pushIfNeeded("working", {
+        taskId: nextTask?.id,
+        result: "PASS",
+      });
+      logInfo("Harness", "═══════════════════════════════════════════════════════════");
       return true;
     } catch (err) {
+      const errMsg = err instanceof Error ? err.message : String(err);
+      if (this.isPromptTooLongText(errMsg)) {
+        logInfo("Harness", "Working prompt too long; retrying with compact prompt...");
+        const compactPrompt = this.buildCompactWorkingPrompt(isProjectSetup, nextTask ?? undefined);
+        try {
+          await this.runQuery(compactPrompt, options, "working");
+          logInfo("Harness", "Working session complete, checking for commits to push...");
+          await this.pushIfNeeded("working", {
+            taskId: nextTask?.id,
+            result: "PASS",
+          });
+          logInfo("Harness", "═══════════════════════════════════════════════════════════");
+          return true;
+        } catch (retryErr) {
+          err = retryErr;
+        }
+      }
+
       logError("Harness", "═══════════════════════════════════════════════════════════");
       logError("Harness", "Working session failed with error", err);
       logError("Harness", "═══════════════════════════════════════════════════════════");
 
       // Still try to push any commits that were made before the failure
       try {
-        await this.pushIfNeeded("working");
+        const errMsg = err instanceof Error ? err.message : String(err);
+        await this.pushIfNeeded("working", {
+          taskId: nextTask?.id,
+          result: "ERROR",
+          reason: `Working session error: ${errMsg}`,
+        });
       } catch (pushErr) {
         logWarn("Harness", "Failed to push after error", pushErr);
       }
@@ -414,7 +517,7 @@ export class LongRunningHarness {
    * Run a single working session for a specific task.
    */
   async runSingleTask(taskId: string): Promise<boolean> {
-    log("Harness", `Starting single-task session for: ${taskId}`);
+    logInfo("Harness", `Starting single-task session for: ${taskId}`);
 
     await this.ensureInitialized();
 
@@ -425,6 +528,13 @@ export class LongRunningHarness {
     }
 
     const isProjectSetup = task.id === "project-setup";
+    if (this.isCodexPrimary()) {
+      if (this.cfg.enableReviewAgent) {
+        return this.runCodexWorkingSessionWithReview(task, isProjectSetup);
+      }
+      return this.runCodexWorkingSession(isProjectSetup, task);
+    }
+
     const options: Options = {
       ...this.buildBaseOptions("working"),
       maxTurns: this.cfg.maxWorkingTurns,
@@ -441,17 +551,43 @@ export class LongRunningHarness {
 
     try {
       await this.runQuery(prompt, options, "working");
-      log("Harness", "Single-task session complete, checking for commits to push...");
-      await this.pushIfNeeded("working");
-      log("Harness", "═══════════════════════════════════════════════════════════");
+      logInfo("Harness", "Single-task session complete, checking for commits to push...");
+      await this.pushIfNeeded("working", {
+        taskId: task.id,
+        result: "PASS",
+      });
+      logInfo("Harness", "═══════════════════════════════════════════════════════════");
       return true;
     } catch (err) {
+      const errMsg = err instanceof Error ? err.message : String(err);
+      if (this.isPromptTooLongText(errMsg)) {
+        logInfo("Harness", "Working prompt too long; retrying with compact prompt...");
+        const compactPrompt = this.buildCompactWorkingPrompt(isProjectSetup, task);
+        try {
+          await this.runQuery(compactPrompt, options, "working");
+          logInfo("Harness", "Single-task session complete, checking for commits to push...");
+          await this.pushIfNeeded("working", {
+            taskId: task.id,
+            result: "PASS",
+          });
+          logInfo("Harness", "═══════════════════════════════════════════════════════════");
+          return true;
+        } catch (retryErr) {
+          err = retryErr;
+        }
+      }
+
       logError("Harness", "═══════════════════════════════════════════════════════════");
       logError("Harness", "Single-task session failed with error", err);
       logError("Harness", "═══════════════════════════════════════════════════════════");
 
       try {
-        await this.pushIfNeeded("working");
+        const errMsg = err instanceof Error ? err.message : String(err);
+        await this.pushIfNeeded("working", {
+          taskId: task.id,
+          result: "ERROR",
+          reason: `Single-task session error: ${errMsg}`,
+        });
       } catch (pushErr) {
         logWarn("Harness", "Failed to push after error", pushErr);
       }
@@ -475,43 +611,57 @@ export class LongRunningHarness {
     isProjectSetup: boolean,
     options: Options
   ): Promise<boolean> {
-    const maxIterations = this.cfg.maxReviewIterations ?? 3;
+    const maxIterations = this.cfg.maxReviewIterations ?? DEFAULT_MAX_REVIEW_ITERATIONS;
 
     let workingSessionId: string | null = null;
     let reviewSessionId: string | null = null;
 
-    log("Harness", "═══════════════════════════════════════════════════════════");
-    log("Harness", "Review agent enabled - using ping-pong flow");
-    log("Harness", "═══════════════════════════════════════════════════════════");
+    logInfo("Harness", "═══════════════════════════════════════════════════════════");
+    logInfo("Harness", "Review agent enabled - using ping-pong flow");
+    logInfo("Harness", "═══════════════════════════════════════════════════════════");
 
     for (let iteration = 1; iteration <= maxIterations; iteration++) {
-      log("Harness", `─── Iteration ${iteration}/${maxIterations} ───`);
+      logInfo("Harness", `─── Iteration ${iteration}/${maxIterations} ───`);
 
       try {
         // Phase 1: Working agent implements or fixes
         if (workingSessionId === null) {
           // First iteration: fresh implementation
-          log("Harness", "Starting working agent (implementation phase)…");
+          logInfo("Harness", "Starting working agent (implementation phase)…");
           const workingPrompt = this.buildWorkingPromptForReview(isProjectSetup, task);
           const result = await this.runQueryWithSessionCapture(workingPrompt, options, "working");
           workingSessionId = result.sessionId;
 
           if (!result.success) {
-            logError("Harness", "Working agent failed during implementation");
-            // DO NOT push - revert to clean state
-            await this.syncRepoFromRemote();
-            return false;
+            if (this.isPromptTooLong(result)) {
+              logInfo("Harness", "Working prompt too long; retrying with compact prompt...");
+              const compactPrompt = this.buildCompactWorkingPromptForReview(isProjectSetup, task);
+              const compactResult = await this.runQueryWithSessionCapture(compactPrompt, options, "working");
+              workingSessionId = compactResult.sessionId;
+
+              if (!compactResult.success) {
+                logError("Harness", "Working agent failed during implementation (compact prompt)");
+                // DO NOT push - revert to clean state
+                await this.syncRepoFromRemote();
+                return false;
+              }
+            } else {
+              logError("Harness", "Working agent failed during implementation");
+              // DO NOT push - revert to clean state
+              await this.syncRepoFromRemote();
+              return false;
+            }
           }
         } else {
           // Subsequent iterations: resume with fix instructions
-          log("Harness", "Resuming working agent (fixing phase)…");
+          logInfo("Harness", "Resuming working agent (fixing phase)…");
           const lastIssues = this.lastReviewIssues ?? [];
           const fixPrompt = this.buildFixPrompt(lastIssues, this.lastReviewIssuesPath);
           const result = await this.resumeSession(workingSessionId, fixPrompt, options, "fixing");
 
           if (!result.success) {
             if (this.isPromptTooLong(result)) {
-              log("Harness", "Working agent resume failed due to prompt length; starting a fresh fix session...");
+              logInfo("Harness", "Working agent resume failed due to prompt length; starting a fresh fix session...");
               const freshPrompt = this.buildFixPrompt(lastIssues, this.lastReviewIssuesPath);
               const freshResult = await this.runQueryWithSessionCapture(freshPrompt, options, "fixing");
               workingSessionId = freshResult.sessionId;
@@ -538,14 +688,17 @@ export class LongRunningHarness {
         const taskList = await this.readTaskList();
         const currentTask = taskList.find((t) => t.id === task.id);
         if (currentTask?.passes === true) {
-          log("Harness", `Task ${task.id} already marked passing - pushing`);
-          await this.pushIfNeeded("working");
+          logInfo("Harness", `Task ${task.id} already marked passing - pushing`);
+          await this.pushIfNeeded("working", {
+            taskId: task.id,
+            result: "PASS",
+          });
           return true;
         }
 
         // Phase 2: Review agent audits (default: codex)
         const useCodex = this.cfg.reviewAgent !== "claude";
-        log("Harness", `Starting review agent (${useCodex ? "codex" : "claude"})…`);
+        logInfo("Harness", `Starting review agent (${useCodex ? "codex" : "claude"})…`);
         let reviewResult: ReviewResult;
         if (useCodex) {
           reviewResult = await this.runCodexReview(task, iteration > 1);
@@ -566,9 +719,9 @@ export class LongRunningHarness {
             continue; // Go to next iteration
           }
 
-          log("Harness", "═══════════════════════════════════════════════════════════");
-          log("Harness", `✓ Review agent APPROVED task: ${task.id}`);
-          log("Harness", "═══════════════════════════════════════════════════════════");
+          logInfo("Harness", "═══════════════════════════════════════════════════════════");
+          logInfo("Harness", `✓ Review agent APPROVED task: ${task.id}`);
+          logInfo("Harness", "═══════════════════════════════════════════════════════════");
           // Only push after review approval (and task marked passing)
           await this.pushIfNeeded("review");
           return true;
@@ -577,9 +730,9 @@ export class LongRunningHarness {
         // Store issues for next fix iteration
         this.lastReviewIssues = reviewResult.issues;
         this.lastReviewIssuesPath = reviewResult.issuesPath ?? this.lastReviewIssuesPath;
-        log("Harness", `Review agent found ${reviewResult.issues.length} issue(s):`);
+        logInfo("Harness", `Review agent found ${reviewResult.issues.length} issue(s):`);
         for (const issue of reviewResult.issues) {
-          log("Harness", `  - ${issue}`);
+          logInfo("Harness", `  - ${issue}`);
         }
 
         if (iteration === maxIterations) {
@@ -592,7 +745,7 @@ export class LongRunningHarness {
           return false;
         }
 
-        log("Harness", "Sending issues to working agent for fixes...");
+        logInfo("Harness", "Sending issues to working agent for fixes...");
 
       } catch (err) {
         const errMsg = err instanceof Error ? err.message : String(err);
@@ -602,13 +755,11 @@ export class LongRunningHarness {
           throw new Error(`Authentication expired: ${errMsg}`);
         }
 
-        const isPromptTooLong = errMsg.toLowerCase().includes("prompt is too long") ||
-          errMsg.toLowerCase().includes("context length") ||
-          errMsg.toLowerCase().includes("too many tokens");
+        const isPromptTooLong = this.isPromptTooLongText(errMsg);
 
         if (isPromptTooLong && workingSessionId !== null && this.lastReviewIssues.length > 0) {
           // Prompt too long during resume - start fresh fix session
-          log("Harness", "Session context too long, starting fresh fix session...");
+          logInfo("Harness", "Session context too long, starting fresh fix session...");
           try {
             const freshPrompt = this.buildFixPrompt(this.lastReviewIssues, this.lastReviewIssuesPath);
             const freshResult = await this.runQueryWithSessionCapture(freshPrompt, options, "fixing");
@@ -619,7 +770,7 @@ export class LongRunningHarness {
               continue;
             }
           } catch (freshErr) {
-            log("Harness", `Fresh fix session also failed: ${freshErr instanceof Error ? freshErr.message : freshErr}`);
+            logInfo("Harness", `Fresh fix session also failed: ${freshErr instanceof Error ? freshErr.message : freshErr}`);
           }
         }
 
@@ -628,6 +779,152 @@ export class LongRunningHarness {
         logError("Harness", "═══════════════════════════════════════════════════════════");
 
         // DO NOT push on error - revert to clean state
+        try {
+          await this.syncRepoFromRemote();
+        } catch (syncErr) {
+          logWarn("Harness", "Failed to sync after error", syncErr);
+        }
+
+        return false;
+      }
+    }
+
+    return false;
+  }
+
+  private async runCodexWorkingSession(
+    isProjectSetup: boolean,
+    task?: TaskSpec
+  ): Promise<boolean> {
+    logInfo("Harness", "Starting Codex working agent session…");
+    const nonce = randomUUID();
+    const prompt = this.buildCodexWorkingPrompt(isProjectSetup, task, nonce);
+
+    try {
+      const result = await this.runCodexAgentPrompt(
+        prompt,
+        "working",
+        "CODEX_WORKING_RESULT",
+        nonce
+      );
+      logInfo("Harness", "Working session complete, checking for commits to push...");
+      const reason = result.passed
+        ? undefined
+        : result.exitCode !== 0
+          ? `Codex working session exitCode=${result.exitCode}.`
+          : "Codex working session reported FAIL.";
+      await this.pushIfNeeded("working", {
+        taskId: task?.id,
+        result: result.passed ? "PASS" : "FAIL",
+        reason,
+      });
+      return result.passed;
+    } catch (err) {
+      logError("Harness", "Codex working session failed", err);
+      try {
+        const errMsg = err instanceof Error ? err.message : String(err);
+        await this.pushIfNeeded("working", {
+          taskId: task?.id,
+          result: "ERROR",
+          reason: `Codex working session error: ${errMsg}`,
+        });
+      } catch (pushErr) {
+        logWarn("Harness", "Failed to push after error", pushErr);
+      }
+      return false;
+    }
+  }
+
+  private async runCodexWorkingSessionWithReview(
+    task: TaskSpec,
+    isProjectSetup: boolean
+  ): Promise<boolean> {
+    const reviewAgent = this.getReviewAgent();
+    if (reviewAgent === "claude") {
+      throw new Error("Codex primary mode requires codex review agent");
+    }
+
+    const maxIterations = this.cfg.maxReviewIterations ?? DEFAULT_MAX_REVIEW_ITERATIONS;
+
+    logInfo("Harness", "═══════════════════════════════════════════════════════════");
+    logInfo("Harness", "Review agent enabled - using Codex ping-pong flow");
+    logInfo("Harness", "═══════════════════════════════════════════════════════════");
+
+    for (let iteration = 1; iteration <= maxIterations; iteration++) {
+      logInfo("Harness", `─── Iteration ${iteration}/${maxIterations} ───`);
+
+      try {
+        const nonce = randomUUID();
+        const prompt = iteration === 1
+          ? this.buildCodexWorkingPromptForReview(isProjectSetup, task, nonce)
+          : this.buildCodexFixPrompt(this.lastReviewIssues, this.lastReviewIssuesPath, nonce);
+
+        const phase: HarnessPhase = iteration === 1 ? "working" : "fixing";
+        const result = await this.runCodexAgentPrompt(
+          prompt,
+          phase,
+          "CODEX_WORKING_RESULT",
+          nonce
+        );
+
+        if (!result.passed) {
+          logError("Harness", "Codex working agent reported failure");
+          await this.syncRepoFromRemote();
+          return false;
+        }
+
+        const taskList = await this.readTaskList();
+        const currentTask = taskList.find((t) => t.id === task.id);
+        if (currentTask?.passes === true) {
+          logInfo("Harness", `Task ${task.id} already marked passing - pushing`);
+          await this.pushIfNeeded("working", {
+            taskId: task.id,
+            result: "PASS",
+          });
+          return true;
+        }
+
+        const reviewResult = await this.runCodexReview(task, iteration > 1);
+        if (reviewResult.passed) {
+          this.lastReviewIssuesPath = null;
+          const updatedTaskList = await this.readTaskList();
+          const updatedTask = updatedTaskList.find((t) => t.id === task.id);
+          if (!updatedTask?.passes) {
+            logWarn("Harness", `Review said PASS but task ${task.id} not marked as passing in task_list.json`);
+            logWarn("Harness", "Treating as failed review - reviewer must update task_list.json");
+            this.lastReviewIssues = ["Reviewer approved but did not update task_list.json"];
+            continue;
+          }
+
+          logInfo("Harness", "═══════════════════════════════════════════════════════════");
+          logInfo("Harness", `✓ Review agent APPROVED task: ${task.id}`);
+          logInfo("Harness", "═══════════════════════════════════════════════════════════");
+          await this.pushIfNeeded("review");
+          return true;
+        }
+
+        this.lastReviewIssues = reviewResult.issues;
+        this.lastReviewIssuesPath = reviewResult.issuesPath ?? this.lastReviewIssuesPath;
+        logInfo("Harness", `Review agent found ${reviewResult.issues.length} issue(s):`);
+        for (const issue of reviewResult.issues) {
+          logInfo("Harness", `  - ${issue}`);
+        }
+
+        if (iteration === maxIterations) {
+          logError("Harness", "═══════════════════════════════════════════════════════════");
+          logError("Harness", `✗ Task ${task.id} failed review after ${maxIterations} iterations`);
+          logError("Harness", "═══════════════════════════════════════════════════════════");
+          await this.syncRepoFromRemote();
+          return false;
+        }
+
+        logInfo("Harness", "Sending issues to working agent for fixes...");
+      } catch (err) {
+        const errMsg = err instanceof Error ? err.message : String(err);
+        logError("Harness", "═══════════════════════════════════════════════════════════");
+        logError("Harness", `Error during iteration ${iteration}: ${errMsg}`);
+        logError("Harness", "═══════════════════════════════════════════════════════════");
+
         try {
           await this.syncRepoFromRemote();
         } catch (syncErr) {
@@ -657,7 +954,7 @@ export class LongRunningHarness {
     const sessionLimit =
       maxSessions && maxSessions > 0 ? maxSessions : Number.MAX_SAFE_INTEGER;
 
-    const maxConsecutiveFailures = 3;
+    const maxConsecutiveFailures = MAX_CONSECUTIVE_FAILURES;
     let consecutiveFailures = 0;
     let successfulSessions = 0;
 
@@ -665,19 +962,19 @@ export class LongRunningHarness {
       const remaining = await this.countRemainingTasks();
       if (remaining === 0) {
         if (!this.cfg.continuous) {
-          log("Harness", "All tasks are marked as passing. Nothing left to do.");
+          logInfo("Harness", "All tasks are marked as passing. Nothing left to do.");
           return;
         }
 
-        log("Harness", "All tasks passing; starting spec audit...");
+        logInfo("Harness", "All tasks passing; starting audit...");
         const auditResult = await this.runSpecAudit();
-        if (auditResult.addedTasks === 0 && auditResult.reopenedTasks === 0) {
-          log("Harness", "Spec audit passed with no new tasks.");
+        if (auditResult.addedTasks === 0) {
+          logInfo("Harness", "Audit passed with no new tasks.");
           return;
         }
-        log(
+        logInfo(
           "Harness",
-          `Spec audit added ${auditResult.addedTasks} task(s) and reopened ${auditResult.reopenedTasks} task(s); continuing.`
+          `Audit added ${auditResult.addedTasks} task(s); continuing.`
         );
         continue;
       }
@@ -715,70 +1012,89 @@ export class LongRunningHarness {
         }
 
         // Brief delay before retrying to avoid hammering the API
-        log("Harness", "Waiting 10 seconds before retrying...");
-        await new Promise((resolve) => setTimeout(resolve, 10000));
+        logInfo("Harness", "Waiting 10 seconds before retrying...");
+        await new Promise((resolve) => setTimeout(resolve, RETRY_DELAY_MS));
       }
 
       if (await this.shouldStopAfterSession()) {
-        log("Harness", "Stop requested; exiting after completing this session.");
+        logInfo("Harness", "Stop requested; exiting after completing this session.");
         return;
       }
     }
 
     if (sessionLimit !== Number.MAX_SAFE_INTEGER) {
-      log("Harness", "Reached maxSessions limit.");
+      logInfo("Harness", "Reached maxSessions limit.");
     } else {
-      log("Harness", "Stopping unlimited run loop.");
+      logInfo("Harness", "Stopping unlimited run loop.");
     }
   }
 
   /**
-   * Run a spec audit when all tasks are passing.
+   * Run an audit when all tasks are passing.
    * Uses the configured review agent where possible, with fallback on failure.
    */
-  async runSpecAudit(): Promise<{ addedTasks: number; reopenedTasks: number }> {
-    const reviewAgent = this.cfg.reviewAgent ?? "codex";
+  async runSpecAudit(): Promise<{ addedTasks: number }> {
+    const auditLens = await this.getNextSpecAuditLens();
+    logInfo("audit", `Audit lens: ${auditLens}`);
+    const reviewAgent = this.getReviewAgent();
+    if (this.isCodexPrimary()) {
+      if (!(await this.hasCodexCredentials())) {
+        logInfo("audit", "Codex credentials not available; skipping audit in codex-only mode.");
+        return { addedTasks: 0 };
+      }
+      try {
+        return await this.runCodexSpecAudit(auditLens);
+      } catch (err) {
+        logInfo(
+          "audit",
+          `Codex audit failed (codex-only): ${err instanceof Error ? err.message : String(err)}`
+        );
+        return { addedTasks: 0 };
+      }
+    }
+
     if (reviewAgent === "claude") {
-      return this.runClaudeSpecAudit();
+      return this.runClaudeSpecAudit(auditLens);
     }
 
     if (!(await this.hasCodexCredentials())) {
-      log("audit", "Codex credentials not available; falling back to Claude spec audit.");
-      return this.runClaudeSpecAudit();
+      logInfo("audit", "Codex credentials not available; falling back to Claude audit.");
+      return this.runClaudeSpecAudit(auditLens);
     }
 
     try {
-      return await this.runCodexSpecAudit();
+      return await this.runCodexSpecAudit(auditLens);
     } catch (err) {
-      log(
+      logInfo(
         "audit",
-        `Codex spec audit failed: ${err instanceof Error ? err.message : String(err)}`
+        `Codex audit failed: ${err instanceof Error ? err.message : String(err)}`
       );
       try {
-        return await this.runClaudeSpecAudit();
+        return await this.runClaudeSpecAudit(auditLens);
       } catch (fallbackErr) {
-        log(
+        logInfo(
           "audit",
-          `Claude spec audit fallback failed: ${fallbackErr instanceof Error ? fallbackErr.message : String(fallbackErr)}`
+          `Claude audit fallback failed: ${fallbackErr instanceof Error ? fallbackErr.message : String(fallbackErr)}`
         );
-        return { addedTasks: 0, reopenedTasks: 0 };
+        return { addedTasks: 0 };
       }
     }
   }
 
   /**
-   * Run a Codex-driven spec audit when all tasks are passing.
-   * Returns counts of new and reopened tasks.
+   * Run a Codex-driven audit when all tasks are passing.
+   * Returns counts of new tasks.
    */
-  private async runCodexSpecAudit(): Promise<{ addedTasks: number; reopenedTasks: number }> {
+  private async runCodexSpecAudit(auditLens: string): Promise<{ addedTasks: number }> {
     const maxAreas = Math.max(1, this.cfg.specAuditMaxAreas ?? 10);
-    const parallelism = Math.max(1, this.cfg.specAuditParallelism ?? 3);
     const repoSummary = await this.buildRepoSummary();
 
-    const plan = await this.runCodexSpecAuditPlan(maxAreas, repoSummary);
-    const areas = this.sanitizeSpecAuditAreas(plan.areas, maxAreas);
+    const plan = await this.runCodexSpecAuditPlan(maxAreas, repoSummary, auditLens);
+    const areas = this.sanitizeSpecAuditAreas(plan.areas, maxAreas, auditLens);
+    this.logSpecAuditPlan(plan, areas);
 
-    const areaResults = await this.runSpecAuditAreas(areas, parallelism, repoSummary);
+    const areaResults = await this.runSpecAuditAreas(areas, repoSummary);
+    this.logSpecAuditAreaResults(areaResults);
     const taskListRaw = await fs.readFile(this.paths.taskList, "utf8");
     const synthesis = await this.runCodexSpecAuditSynthesis(
       plan,
@@ -787,43 +1103,44 @@ export class LongRunningHarness {
       taskListRaw,
       repoSummary
     );
+    this.logSpecAuditSynthesis(synthesis);
 
-    const { addedTasks, reopenedTasks } = await this.applySpecAuditResults(
+    const { addedTasks } = await this.applySpecAuditResults(
       synthesis,
-      areas.length
+      areas.length,
+      auditLens
     );
 
     await this.pushIfNeeded("audit");
 
-    return { addedTasks, reopenedTasks };
+    return { addedTasks };
   }
 
-  private async runClaudeSpecAudit(): Promise<{ addedTasks: number; reopenedTasks: number }> {
+  private async runClaudeSpecAudit(auditLens: string): Promise<{ addedTasks: number }> {
     const before = await this.readTaskList();
     const options: Options = {
       ...this.buildBaseOptions("audit"),
-      maxTurns: this.cfg.maxReviewTurns ?? 60,
+      maxTurns: this.cfg.maxReviewTurns ?? DEFAULT_MAX_AUDIT_TURNS,
       permissionMode: "bypassPermissions",
       allowDangerouslySkipPermissions: true,
       ...this.cfg.sdkOptionsOverride,
     };
 
-    await this.runQuery(this.buildSpecAuditClaudePrompt(), options, "audit");
+    await this.runQuery(this.buildSpecAuditClaudePrompt(auditLens), options, "audit");
 
     const after = await this.readTaskList();
-    const { addedTasks, reopenedTasks } = this.countTaskChanges(before, after);
+    const { addedTasks } = this.countTaskChanges(before, after);
 
     await this.pushIfNeeded("audit");
-    return { addedTasks, reopenedTasks };
+    return { addedTasks };
   }
 
   private countTaskChanges(
     before: TaskList,
     after: TaskList
-  ): { addedTasks: number; reopenedTasks: number } {
+  ): { addedTasks: number } {
     const beforeById = new Map(before.map((task) => [task.id, task]));
     let addedTasks = 0;
-    let reopenedTasks = 0;
 
     for (const task of after) {
       const prev = beforeById.get(task.id);
@@ -831,12 +1148,9 @@ export class LongRunningHarness {
         addedTasks += 1;
         continue;
       }
-      if (prev.passes === true && task.passes === false) {
-        reopenedTasks += 1;
-      }
     }
 
-    return { addedTasks, reopenedTasks };
+    return { addedTasks };
   }
 
   private async hasCodexCredentials(): Promise<boolean> {
@@ -848,27 +1162,16 @@ export class LongRunningHarness {
 
   private async runSpecAuditAreas(
     areas: SpecAuditPlanArea[],
-    parallelism: number,
     repoSummary: string
   ): Promise<SpecAuditAreaResult[]> {
     if (areas.length === 0) {
       return [];
     }
 
-    const queue = [...areas];
-    const results: SpecAuditAreaResult[] = [];
-    const workerCount = Math.min(parallelism, areas.length);
-
-    const workers = Array.from({ length: workerCount }, async () => {
-      while (queue.length > 0) {
-        const area = queue.shift();
-        if (!area) return;
-        const result = await this.runCodexSpecAuditArea(area, repoSummary);
-        results.push(result);
-      }
-    });
-
-    await Promise.all(workers);
+    // Run all areas in parallel
+    const results = await Promise.all(
+      areas.map((area) => this.runCodexSpecAuditArea(area, repoSummary))
+    );
     return results;
   }
 
@@ -892,9 +1195,40 @@ export class LongRunningHarness {
     }
   }
 
+  private getSpecAuditLenses(): string[] {
+    return ["integration-testing", "correctness", "safety", "maintainability"];
+  }
+
+  private async getNextSpecAuditLens(): Promise<string> {
+    const lenses = this.getSpecAuditLenses();
+    if (!(await pathExists(this.paths.progressLog))) {
+      return lenses[0];
+    }
+    try {
+      const contents = await fs.readFile(this.paths.progressLog, "utf8");
+      const pattern = /(?:Spec audit|Audit)[^\n]*\blens=([a-z-]+)/g;
+      let match: RegExpExecArray | null = null;
+      let lastLens: string | undefined;
+      while ((match = pattern.exec(contents)) !== null) {
+        lastLens = match[1];
+      }
+      if (!lastLens) {
+        return lenses[0];
+      }
+      const lastIndex = lenses.indexOf(lastLens);
+      if (lastIndex === -1) {
+        return lenses[0];
+      }
+      return lenses[(lastIndex + 1) % lenses.length];
+    } catch {
+      return lenses[0];
+    }
+  }
+
   private sanitizeSpecAuditAreas(
     areas: SpecAuditPlanArea[] | undefined,
-    maxAreas: number
+    maxAreas: number,
+    auditLens: string
   ): SpecAuditPlanArea[] {
     const safeAreas = Array.isArray(areas) ? areas : [];
     const normalized: SpecAuditPlanArea[] = [];
@@ -919,6 +1253,7 @@ export class LongRunningHarness {
         id,
         title: rawTitle || id,
         focus: rawFocus || "General review",
+        lens: auditLens,
         paths: Array.isArray(area.paths) ? area.paths.filter((p) => typeof p === "string") : [],
         rationale: typeof area.rationale === "string" ? area.rationale.trim() : undefined,
       });
@@ -930,6 +1265,7 @@ export class LongRunningHarness {
         id: "general",
         title: "General",
         focus: "Overall implementation and spec coverage",
+        lens: auditLens,
         paths: [],
       });
     }
@@ -939,10 +1275,11 @@ export class LongRunningHarness {
 
   private async runCodexSpecAuditPlan(
     maxAreas: number,
-    repoSummary: string
+    repoSummary: string,
+    auditLens: string
   ): Promise<SpecAuditPlan> {
     const nonce = randomUUID();
-    const prompt = this.buildSpecAuditPlanPrompt(maxAreas, repoSummary, nonce);
+    const prompt = this.buildSpecAuditPlanPrompt(maxAreas, repoSummary, nonce, auditLens);
     const output = await this.execCodexPrompt(prompt, "audit-plan", this.cfg.specAuditModel ?? this.cfg.codexModel);
     const json = this.extractCodexJson(output, "CODEX_AUDIT_PLAN", nonce);
     return JSON.parse(json) as SpecAuditPlan;
@@ -990,30 +1327,17 @@ export class LongRunningHarness {
 
   private async applySpecAuditResults(
     synthesis: SpecAuditSynthesis,
-    areaCount: number
-  ): Promise<{ addedTasks: number; reopenedTasks: number }> {
+    areaCount: number,
+    auditLens: string
+  ): Promise<{ addedTasks: number }> {
     const taskList = await this.readTaskList();
+    const keyOrder = taskList.length > 0 ? Object.keys(taskList[0]) : undefined;
     const existingIds = new Set(taskList.map((task) => task.id));
-    const reopened = new Set<string>();
-    let reopenedTasks = 0;
     let addedTasks = 0;
-
-    for (const reopen of synthesis.reopen_tasks ?? []) {
-      if (!reopen || typeof reopen.id !== "string") continue;
-      const id = reopen.id.trim();
-      if (!id || reopened.has(id)) continue;
-      const entry = taskList.find((task) => task.id === id);
-      if (!entry) continue;
-      if (entry.passes !== false) {
-        entry.passes = false;
-        reopenedTasks += 1;
-      }
-      reopened.add(id);
-    }
 
     const newTasks = Array.isArray(synthesis.new_tasks) ? synthesis.new_tasks : [];
     for (const rawTask of newTasks) {
-      const normalized = this.normalizeNewTask(rawTask);
+      const normalized = this.normalizeNewTask(rawTask, keyOrder, false);
       if (!normalized) continue;
       let id = normalized.id;
       if (existingIds.has(id)) {
@@ -1022,7 +1346,6 @@ export class LongRunningHarness {
         id = `${id}-${suffix}`;
       }
       normalized.id = id;
-      normalized.passes = false;
       taskList.push(normalized);
       existingIds.add(id);
       addedTasks += 1;
@@ -1032,9 +1355,9 @@ export class LongRunningHarness {
       synthesis.result ? synthesis.result.toUpperCase() : "UNKNOWN",
       `${areaCount} area(s)`,
       `${addedTasks} new`,
-      `${reopenedTasks} reopened`,
+      `lens=${auditLens}`,
     ];
-    const progressEntry = `[${new Date().toISOString()}] Spec audit (codex): ${summaryBits.join(", ")}.\n`;
+    const progressEntry = `[${new Date().toISOString()}] Audit (codex): ${summaryBits.join(", ")}.\n`;
 
     await fs.writeFile(this.paths.taskList, JSON.stringify(taskList, null, 2) + "\n");
     await fs.appendFile(this.paths.progressLog, progressEntry, "utf8");
@@ -1045,38 +1368,46 @@ export class LongRunningHarness {
 
     const status = await execFileAsync("git", ["-C", this.workingDir, "status", "--porcelain"], { env });
     if (status.stdout.trim()) {
-      const message = `Spec audit: ${addedTasks} new, ${reopenedTasks} reopened`;
+      const message = `Audit: ${addedTasks} new`;
       await execFileAsync("git", ["-C", this.workingDir, "commit", "-m", message], { env });
     }
 
-    return { addedTasks, reopenedTasks };
+    return { addedTasks };
   }
 
-  private normalizeNewTask(raw: TaskSpec | undefined): TaskSpec | null {
+  private normalizeNewTask(
+    raw: TaskSpec | undefined,
+    _keyOrder?: string[],
+    passesOverride?: boolean
+  ): TaskSpec | null {
     if (!raw || typeof raw !== "object") return null;
     const id = typeof raw.id === "string" ? this.normalizeTaskId(raw.id) : "";
     const description = typeof raw.description === "string" ? raw.description.trim() : "";
     const category = typeof raw.category === "string" ? raw.category.trim() : "audit";
     const steps = Array.isArray(raw.steps)
-      ? raw.steps.filter((step) => typeof step === "string" && step.trim().length > 0)
+      ? raw.steps.filter((step): step is string => typeof step === "string" && step.trim().length > 0)
       : [];
     if (!id || !description || steps.length === 0) return null;
 
     const depends_on = Array.isArray(raw.depends_on)
-      ? raw.depends_on.filter((dep) => typeof dep === "string" && dep.trim().length > 0)
+      ? raw.depends_on.filter((dep): dep is string => typeof dep === "string" && dep.trim().length > 0)
       : undefined;
     const scope = Array.isArray(raw.scope)
-      ? raw.scope.filter((entry) => typeof entry === "string" && entry.trim().length > 0)
+      ? raw.scope.filter((entry): entry is string => typeof entry === "string" && entry.trim().length > 0)
       : undefined;
 
-    return {
+    // Build the normalized task with proper types
+    const task: TaskSpec = {
       id,
       category,
       description,
       steps,
-      depends_on,
-      scope,
+      ...(depends_on && depends_on.length > 0 ? { depends_on } : {}),
+      ...(scope && scope.length > 0 ? { scope } : {}),
+      ...(typeof passesOverride === "boolean" ? { passes: passesOverride } : {}),
     };
+
+    return task;
   }
 
   private normalizeTaskId(value: string): string {
@@ -1088,26 +1419,125 @@ export class LongRunningHarness {
       .replace(/-+/g, "-");
   }
 
-  private extractCodexJson(output: string, marker: string, nonce: string): string {
-    const pattern = new RegExp(
-      `<<<${marker}:${nonce}>>>\\s*([\\s\\S]*?)\\s*<<<END_${marker}:${nonce}>>>`,
-      "g"
+  private logSpecAuditPlan(plan: SpecAuditPlan, areas: SpecAuditPlanArea[]): void {
+    logInfo("audit", `Audit plan: ${areas.length} area(s).`);
+    for (const area of areas) {
+      const focus = summarizeValue(area.focus, 180);
+      const title = summarizeValue(area.title, 120);
+      const lens = summarizeValue(area.lens, 80);
+      const paths = Array.isArray(area.paths) && area.paths.length > 0
+        ? ` paths=${area.paths.join(", ")}`
+        : "";
+      const lensSuffix = lens ? ` lens="${lens}"` : "";
+      logInfo("audit", `Audit area: ${area.id} "${title}"${lensSuffix} focus="${focus}"${paths}`);
+    }
+    if (plan.notes && plan.notes.length > 0) {
+      for (const note of plan.notes) {
+        logInfo("audit", `Audit plan note: ${summarizeValue(note, 240)}`);
+      }
+    }
+  }
+
+  private logSpecAuditAreaResults(areaResults: SpecAuditAreaResult[]): void {
+    for (const result of areaResults) {
+      const summary = summarizeValue(result.summary, 240);
+      logInfo("audit", `Audit result: ${result.area_id} ${result.status}${summary ? ` - ${summary}` : ""}`);
+      const issues = Array.isArray(result.issues) ? result.issues : [];
+      for (const issue of issues) {
+        const category = issue.category ? issue.category : "issue";
+        const severity = issue.severity ? issue.severity : "unspecified";
+        const detail = summarizeValue(issue.issue, 260);
+        const evidence = summarizeValue(issue.evidence, 200);
+        const specRef = summarizeValue(issue.spec_ref, 200);
+        const suffixParts = [];
+        if (evidence) suffixParts.push(`evidence=${evidence}`);
+        if (specRef) suffixParts.push(`spec=${specRef}`);
+        const suffix = suffixParts.length > 0 ? ` (${suffixParts.join("; ")})` : "";
+        logInfo("audit", `Audit issue: [${severity}/${category}] ${detail}${suffix}`);
+      }
+      const notes = Array.isArray(result.notes) ? result.notes : [];
+      for (const note of notes) {
+        logInfo("audit", `Audit note: ${summarizeValue(note, 240)}`);
+      }
+    }
+  }
+
+  private logSpecAuditSynthesis(synthesis: SpecAuditSynthesis): void {
+    const newTasks = Array.isArray(synthesis.new_tasks) ? synthesis.new_tasks : [];
+    logInfo(
+      "audit",
+      `Audit synthesis: result=${synthesis.result}, new_tasks=${newTasks.length}`
     );
+    for (const task of newTasks) {
+      const description = summarizeValue(task.description, 260);
+      logInfo("audit", `Audit new task: ${task.id} ${description ? `- ${description}` : ""}`);
+    }
+    if (synthesis.summary && synthesis.summary.length > 0) {
+      for (const note of synthesis.summary) {
+        logInfo("audit", `Audit summary: ${summarizeValue(note, 240)}`);
+      }
+    }
+  }
+
+  private extractCodexJson(output: string, marker: string, nonce?: string): string {
+    const pattern = nonce
+      ? new RegExp(
+        `<<<${marker}:${nonce}>>>\\s*([\\s\\S]*?)\\s*<<<END_${marker}:${nonce}>>>`,
+        "g"
+      )
+      : new RegExp(
+        `<<<${marker}:([a-zA-Z0-9-]+)>>>\\s*([\\s\\S]*?)\\s*<<<END_${marker}:\\1>>>`,
+        "g"
+      );
     const matches = [...output.matchAll(pattern)];
     if (matches.length === 0) {
       throw new Error(`Failed to parse Codex output for ${marker}`);
     }
     const last = matches[matches.length - 1];
-    return (last?.[1] ?? "").trim();
+    const payload = nonce ? last?.[1] : last?.[2];
+    return (payload ?? "").trim();
   }
 
-  private async execCodexPrompt(prompt: string, label: string, model?: string): Promise<string> {
-    log("audit", `Running Codex CLI (${label})...`);
-    const args = ["exec"];
+  private normalizeCodexResult(value: string | undefined): "PASS" | "FAIL" {
+    const normalized = (value ?? "").trim().toUpperCase();
+    if (normalized === "PASS" || normalized === "FAIL") {
+      return normalized;
+    }
+    throw new Error(`Invalid Codex result value: ${value ?? "(missing)"}`);
+  }
+
+  private parseCodexAgentResult(
+    output: string,
+    marker: string,
+    nonce: string
+  ): CodexAgentResultPayload {
+    const json = this.extractCodexJson(output, marker, nonce);
+    const payload = JSON.parse(json) as CodexAgentResultPayload;
+    if (!payload || typeof payload !== "object") {
+      throw new Error(`Codex output for ${marker} is not a JSON object`);
+    }
+    return payload;
+  }
+
+  private async execCodexJson(
+    prompt: string,
+    label: string,
+    model?: string,
+    logPrefix?: string,
+    logMode?: CodexLogMode,
+    suppressMarkers?: string[]
+  ): Promise<{
+    exitCode: number;
+    agentMessages: string[];
+    lastAgentMessage: string;
+    stderr: string;
+  }> {
+    logInfo("Harness", `Running Codex CLI (${label})...`);
+    const args = ["exec", "--json"];
     if (model) {
       args.push("-m", model);
     }
-    args.push("--dangerously-bypass-approvals-and-sandbox", "--skip-git-repo-check", prompt);
+    args.push("--dangerously-bypass-approvals-and-sandbox", "--skip-git-repo-check", "-");
 
     return new Promise((resolve, reject) => {
       const proc = spawn("codex", args, {
@@ -1119,24 +1549,296 @@ export class LongRunningHarness {
         stdio: ["pipe", "pipe", "pipe"],
       });
 
-      let stdout = "";
+      const mode = logMode ?? this.getCodexLogMode();
+      const agentMessages: string[] = [];
+      let lastAgentMessage = "";
+      let stdoutBuffer = "";
       let stderr = "";
+      const streamBuffers = new Map<string, string>();
+      const logState = { logged: false };
+
+      const logLine = (line: string): void => {
+        if (!logPrefix) return;
+        const trimmed = line.trim();
+        if (!trimmed) return;
+        if (trimmed.startsWith("<<<CODEX_") || trimmed.startsWith("<<<END_CODEX_")) return;
+        if (suppressMarkers && suppressMarkers.some((marker) => trimmed.includes(marker))) return;
+        logState.logged = true;
+        logInfo(logPrefix, `codex: ${trimmed}`);
+      };
+
+      const logReasoning = (text: string): void => {
+        if (mode === "quiet") return;
+        const lines = text.split("\n").map((line) => line.trim()).filter(Boolean);
+        if (mode === "full") {
+          for (const line of lines) {
+            logLine(line);
+          }
+          return;
+        }
+        let logged = false;
+        for (const line of lines) {
+          if (line.startsWith("**") || line.startsWith("thinking")) {
+            logLine(line);
+            logged = true;
+          }
+        }
+        if (!logged && lines[0]) {
+          logLine(lines[0].slice(0, 200));
+        }
+      };
+
+      const formatDuration = (duration: any): string => {
+        const secs = typeof duration?.secs === "number" ? duration.secs : 0;
+        const nanos = typeof duration?.nanos === "number" ? duration.nanos : 0;
+        const ms = secs * 1000 + nanos / 1e6;
+        return `${ms.toFixed(0)}ms`;
+      };
+
+      const logExecBegin = (cmd: string, cwd?: string): void => {
+        if (mode === "quiet") return;
+        const cwdNote = cwd ? ` (cwd ${cwd})` : "";
+        logLine(`exec ${cmd}${cwdNote}`);
+      };
+
+      const logExecEnd = (exitCode: number, duration?: any): void => {
+        if (exitCode === 0 && mode !== "full") return;
+        const dur = duration ? ` in ${formatDuration(duration)}` : "";
+        logLine(`exec exit ${exitCode}${dur}`);
+      };
+
+      const logOutputDelta = (stream: string, chunk: number[], callId: string): void => {
+        const text = Buffer.from(chunk).toString("utf8");
+        const key = `${callId}:${stream}`;
+        const buffer = (streamBuffers.get(key) ?? "") + text;
+        const lines = buffer.split("\n");
+        streamBuffers.set(key, lines.pop() ?? "");
+
+        const shouldLog =
+          mode === "full" ||
+          (mode === "summary" && stream === "stderr");
+        if (!shouldLog) return;
+        for (const line of lines) {
+          logLine(line);
+        }
+      };
+
+      const logErrorOutput = (stderrText: string): void => {
+        if (!stderrText.trim()) return;
+        const lines = stderrText.split("\n").map((line) => line.trim()).filter(Boolean);
+        const limited = lines.slice(0, 20);
+        for (const line of limited) {
+          logLine(line);
+        }
+        if (lines.length > limited.length) {
+          logLine(`(stderr truncated, ${lines.length - limited.length} more lines)`);
+        }
+      };
+
+      const logTextBlock = (text: string, maxLines: number): void => {
+        const lines = text.split("\n").map((line) => line.trim()).filter(Boolean);
+        const limited = lines.slice(0, maxLines);
+        for (const line of limited) {
+          logLine(line);
+        }
+        if (lines.length > limited.length) {
+          logLine(`(output truncated, ${lines.length - limited.length} more lines)`);
+        }
+      };
+
+      const handleMessage = (msg: any): void => {
+        switch (msg?.type) {
+          case "task_started":
+            if (mode !== "quiet") {
+              logLine("task started");
+            }
+            break;
+          case "agent_reasoning":
+            if (typeof msg.text === "string") {
+              logReasoning(msg.text);
+            }
+            break;
+          case "exec_command_begin": {
+            const cmd = Array.isArray(msg.command) ? msg.command.join(" ") : String(msg.command ?? "");
+            const cwd = typeof msg.cwd === "string" ? msg.cwd : undefined;
+            logExecBegin(cmd, cwd);
+            break;
+          }
+          case "exec_command_output_delta": {
+            if (Array.isArray(msg.chunk)) {
+              logOutputDelta(String(msg.stream ?? "stdout"), msg.chunk, String(msg.call_id ?? "unknown"));
+            }
+            break;
+          }
+          case "exec_command_end": {
+            const exitCode = typeof msg.exit_code === "number" ? msg.exit_code : 0;
+            logExecEnd(exitCode, msg.duration);
+            if (exitCode !== 0) {
+              const stderrText = typeof msg.stderr === "string" ? msg.stderr : "";
+              if (mode !== "full") {
+                logErrorOutput(stderrText);
+              }
+            }
+            break;
+          }
+          case "agent_message": {
+            if (typeof msg.message === "string") {
+              agentMessages.push(msg.message);
+              lastAgentMessage = msg.message;
+              if (mode === "full") {
+                const stripped = msg.message.replace(/<<<CODEX_[\s\S]*?<<<END_CODEX_[^>]*>>>/g, "").trim();
+                if (stripped) {
+                  for (const line of stripped.split("\n")) {
+                    logLine(line);
+                  }
+                }
+              } else if (mode === "summary") {
+                const stripped = msg.message.replace(/<<<CODEX_[\s\S]*?<<<END_CODEX_[^>]*>>>/g, "").trim();
+                if (stripped) {
+                  const firstLine = stripped.split("\n")[0];
+                  if (firstLine) logLine(firstLine.slice(0, 200));
+                }
+              }
+            }
+            break;
+          }
+          default:
+            break;
+        }
+      };
+
+      const handleLegacyEvent = (event: any): void => {
+        const eventType = typeof event?.type === "string" ? event.type : "";
+        if (!eventType) return;
+
+        if (eventType === "thread.started" || eventType === "turn.started") {
+          if (mode !== "quiet") {
+            logLine(eventType.replace(".", " "));
+          }
+          return;
+        }
+
+        if (eventType === "error") {
+          const message = typeof event?.message === "string" ? event.message : "unknown error";
+          logLine(`error ${message}`);
+          return;
+        }
+
+        if (eventType === "turn.failed") {
+          const message = typeof event?.error?.message === "string" ? event.error.message : "turn failed";
+          logLine(`turn failed: ${message}`);
+          return;
+        }
+
+        if (eventType === "turn.completed") {
+          if (mode !== "quiet") {
+            logLine("turn completed");
+          }
+          return;
+        }
+
+        if (eventType === "item.started" || eventType === "item.completed") {
+          const item = event?.item ?? {};
+          const itemType = typeof item?.type === "string" ? item.type : "";
+          if (itemType === "reasoning" && typeof item?.text === "string") {
+            logReasoning(item.text);
+            return;
+          }
+          if (itemType === "agent_message" && typeof item?.text === "string") {
+            agentMessages.push(item.text);
+            lastAgentMessage = item.text;
+            if (mode === "full") {
+              const stripped = item.text.replace(/<<<CODEX_[\s\S]*?<<<END_CODEX_[^>]*>>>/g, "").trim();
+              if (stripped) {
+                logTextBlock(stripped, 200);
+              }
+            } else if (mode === "summary") {
+              const stripped = item.text.replace(/<<<CODEX_[\s\S]*?<<<END_CODEX_[^>]*>>>/g, "").trim();
+              if (stripped) {
+                const firstLine = stripped.split("\n")[0];
+                if (firstLine) logLine(firstLine.slice(0, 200));
+              }
+            }
+            return;
+          }
+          if (itemType === "command_execution") {
+            const command = typeof item?.command === "string" ? item.command : "";
+            if (eventType === "item.started") {
+              if (command) logExecBegin(command);
+              return;
+            }
+            const exitCode = typeof item?.exit_code === "number" ? item.exit_code : 0;
+            logExecEnd(exitCode);
+            const output = typeof item?.aggregated_output === "string" ? item.aggregated_output : "";
+            if (output) {
+              if (mode === "full") {
+                logTextBlock(output, 200);
+              } else if (exitCode !== 0) {
+                logTextBlock(output, 40);
+              }
+            }
+          }
+        }
+      };
 
       proc.stdout.on("data", (data: Buffer) => {
-        stdout += data.toString();
+        stdoutBuffer += data.toString();
+        const lines = stdoutBuffer.split("\n");
+        stdoutBuffer = lines.pop() ?? "";
+        for (const line of lines) {
+          if (!line.trim()) continue;
+          try {
+            const parsed = JSON.parse(line);
+            if (parsed?.msg) {
+              handleMessage(parsed.msg);
+            } else if (parsed?.type) {
+              handleLegacyEvent(parsed);
+            }
+          } catch (err) {
+            logWarn("Harness", `Failed to parse Codex JSON line: ${line.slice(0, 200)}`);
+          }
+        }
       });
 
       proc.stderr.on("data", (data: Buffer) => {
         stderr += data.toString();
       });
 
+      if (proc.stdin) {
+        proc.stdin.write(prompt);
+        proc.stdin.end();
+      }
+
       proc.on("close", (code) => {
-        if (code !== 0) {
-          log("audit", `Codex CLI exited with code ${code} (${label}).`);
-        } else {
-          log("audit", `Codex CLI completed (${label}).`);
+        if (stdoutBuffer.trim()) {
+          try {
+            const parsed = JSON.parse(stdoutBuffer);
+            if (parsed?.msg) {
+              handleMessage(parsed.msg);
+            } else if (parsed?.type) {
+              handleLegacyEvent(parsed);
+            }
+          } catch {
+            logWarn("Harness", `Failed to parse Codex JSON tail: ${stdoutBuffer.slice(0, 200)}`);
+          }
         }
-        resolve(stdout + stderr);
+        if (stderr.trim()) {
+          logWarn("Harness", `Codex CLI stderr (${label}): ${stderr.trim().slice(0, 500)}`);
+        }
+        if (!logState.logged && logPrefix && mode !== "quiet") {
+          logInfo(logPrefix, "codex: (no streaming events)");
+        }
+        if (code !== 0) {
+          logInfo("Harness", `Codex CLI exited with code ${code} (${label}).`);
+        } else {
+          logInfo("Harness", `Codex CLI completed (${label}).`);
+        }
+        resolve({
+          exitCode: code ?? 0,
+          agentMessages,
+          lastAgentMessage,
+          stderr,
+        });
       });
 
       proc.on("error", (err) => {
@@ -1145,12 +1847,24 @@ export class LongRunningHarness {
     });
   }
 
+  private async execCodexPrompt(prompt: string, label: string, model?: string): Promise<string> {
+    const result = await this.execCodexJson(
+      prompt,
+      label,
+      model,
+      "audit",
+      this.getCodexLogMode()
+    );
+    return result.agentMessages.join("\n");
+  }
+
   private buildSpecAuditPlanPrompt(
     maxAreas: number,
     repoSummary: string,
-    nonce: string
+    nonce: string,
+    auditLens: string
   ): string {
-    return `You are setting up a spec audit for a Looper-managed project.
+    return `You are setting up an audit for a Looper-managed project.
 
 Project spec:
 ---
@@ -1162,14 +1876,20 @@ ${repoSummary}
 Your job: decide how many reviewers (1-${maxAreas}) are needed and define
 non-overlapping functional areas to audit. Use fewer areas for small codebases.
 If you need more context, inspect the repo (git ls-files, rg, ls).
+This audit's lens is "${auditLens}". Use ONLY this lens for every area.
+Lens options: integration-testing, correctness, safety, maintainability.
 
-Return ONLY valid JSON between the markers, with this shape:
+OUTPUT FORMAT (MACHINE READABLE ONLY):
+Return EXACTLY one block with valid JSON between the markers. Do not include any other text.
+
+Schema:
 {
   "areas": [
     {
       "id": "kebab-case-id",
       "title": "Area name",
       "focus": "What to review in this area",
+      "lens": "integration-testing|correctness|safety|maintainability",
       "paths": ["optional/path", "optional/glob"],
       "rationale": "why this area matters"
     }
@@ -1178,7 +1898,7 @@ Return ONLY valid JSON between the markers, with this shape:
 }
 
 <<<CODEX_AUDIT_PLAN:${nonce}>>>
-<json>
+{"areas":[{"id":"kebab-case-id","title":"Area name","focus":"What to review in this area","lens":"${auditLens}","paths":["optional/path"],"rationale":"why this area matters"}],"notes":["optional notes"]}
 <<<END_CODEX_AUDIT_PLAN:${nonce}>>>`;
   }
 
@@ -1188,7 +1908,7 @@ Return ONLY valid JSON between the markers, with this shape:
     nonce: string
   ): string {
     const paths = (area.paths ?? []).join(", ");
-    return `You are a SPEC AUDITOR for a Looper-managed project.
+    return `You are an AUDITOR for a Looper-managed project.
 
 Project spec:
 ---
@@ -1200,30 +1920,62 @@ ${repoSummary}
 Area ID: ${area.id}
 Area title: ${area.title}
 Area focus: ${area.focus}
+Lens: ${area.lens ?? "spec"}
 Relevant paths: ${paths || "(none specified)"}
 
-Audit this area against the spec. Look for missing behavior, incorrect behavior,
-or untested/untested-critical paths. If you need more context, inspect the repo.
-Do NOT modify any files.
+Audit this area using the lens above. Lens guide:
+- integration-testing: cross-component flows, realistic scenarios, missing integration tests
+- correctness: spec adherence, bugs, edge cases, test coverage gaps
+- safety: security + reliability (input validation, auth, data exposure, failure handling)
+- maintainability: refactor needs, docs/observability debt, unclear boundaries, perf smells
+If the lens doesn't apply, say so in notes and still report clear issues you find.
 
-Return ONLY valid JSON between the markers:
+How to audit:
+- Run init.sh and tests; capture actual failures
+- Use rg to find spec keywords in code
+- Check for TODO/FIXME markers indicating incomplete work
+- Look at recent git history for context
+- Identify missing integration tests relevant to the area and lens
+- If lens=integration-testing, prioritize new integration test tasks and run available integration tests
+
+Evidence requirements:
+- Cite specific file:line for code issues
+- Include command output for test failures
+- Quote spec text when claiming a spec violation; otherwise use spec_ref="n/a" or a brief rationale
+
+Severity guide:
+- HIGH: Spec requirement not met, data loss risk, security hole
+- MEDIUM: Partial implementation, edge case failures, missing tests
+- LOW: Minor deviations, documentation gaps
+
+Do NOT:
+- Modify any files
+- Report issues outside your assigned area
+- Drift away from your assigned lens unless you spot a clear, high-impact issue
+- Flag style/formatting issues (focus on behavior)
+
+OUTPUT FORMAT (MACHINE READABLE ONLY):
+Return EXACTLY one block with valid JSON between the markers. Do not include any other text.
+
+Schema:
 {
   "area_id": "${area.id}",
   "status": "PASS" | "FAIL",
   "summary": "short summary",
   "issues": [
     {
+      "category": "missing|incorrect|edge-case|untested|security|bug|refactor|performance|reliability|docs|observability|ux",
       "issue": "what is missing or wrong",
       "evidence": "file:line or command output",
       "severity": "high|medium|low",
-      "spec_ref": "spec section or quote"
+      "spec_ref": "spec section or quote (or 'n/a')"
     }
   ],
   "notes": ["optional notes"]
 }
 
 <<<CODEX_AUDIT_AREA:${nonce}>>>
-<json>
+{"area_id":"${area.id}","status":"PASS","summary":"short summary","issues":[],"notes":["optional notes"]}
 <<<END_CODEX_AUDIT_AREA:${nonce}>>>`;
   }
 
@@ -1235,7 +1987,7 @@ Return ONLY valid JSON between the markers:
     repoSummary: string,
     nonce: string
   ): string {
-    return `You are synthesizing a spec audit for a Looper-managed project.
+    return `You are synthesizing an audit for a Looper-managed project.
 
 Project spec:
 ---
@@ -1257,40 +2009,40 @@ Existing task_list.json:
 ${taskListRaw}
 
 Your job: turn findings into actionable tasks.
-- If gaps are found, output new tasks or reopen existing ones.
-- Avoid duplicate tasks; if an existing task should be revisited, list it in reopen_tasks.
-- Ensure any new task id is unique within task_list.json; if it already exists, reopen it or pick a new id.
+- If gaps are found, output new tasks only. Do NOT reopen existing tasks.
+- Include integration test gaps, correctness issues, safety issues, and maintainability concerns when found.
+- Create a new task for each distinct bug/issue, with clear details and verification steps.
+- Prefer adding integration test tasks when cross-component behavior is unverified.
+- Integration test tasks should include steps to add the test, run it, fix failures, and re-run.
+- Avoid duplicate tasks; ensure any new task id is unique within task_list.json.
 - If everything is covered, return PASS with empty arrays.
 
-Return ONLY valid JSON between the markers:
+OUTPUT FORMAT (MACHINE READABLE ONLY):
+Return EXACTLY one block with valid JSON between the markers. Do not include any other text.
+
+Schema:
 {
   "result": "PASS" | "FAIL",
   "new_tasks": [
     {
       "id": "kebab-case-id",
-      "category": "functional|api|ui|infra|test|security|performance|docs|audit",
+      "category": "functional|api|ui|infra|test|security|performance|docs|bug|refactor|reliability|observability|ux|audit",
       "description": "one sentence",
       "steps": ["manual verification step 1", "step 2"],
       "depends_on": ["optional-task-id"],
       "scope": ["optional/path"]
     }
   ],
-  "reopen_tasks": [
-    {
-      "id": "existing-task-id",
-      "reason": "why it must be reopened"
-    }
-  ],
   "summary": ["brief notes for humans"]
 }
 
 <<<CODEX_AUDIT_SYNTHESIS:${nonce}>>>
-<json>
+{"result":"PASS","new_tasks":[],"summary":["brief notes for humans"]}
 <<<END_CODEX_AUDIT_SYNTHESIS:${nonce}>>>`;
   }
 
-  private buildSpecAuditClaudePrompt(): string {
-    return `You are running a spec audit for a Looper-managed project.
+  private buildSpecAuditClaudePrompt(auditLens: string): string {
+    return `You are running an audit for a Looper-managed project.
 
 Project spec:
 ---
@@ -1298,22 +2050,28 @@ ${this.cfg.projectSpec.trim()}
 ---
 
 Your job:
-- Verify the repo matches the spec.
+- Verify the repo matches the spec, but focus this audit on a single lens.
+- Lens options: integration-testing, correctness, safety, maintainability.
+- This audit lens is "${auditLens}". Apply it thoroughly; do not try to cover all lenses.
 - Run relevant checks (init.sh, tests) when available.
-- If gaps exist, add new tasks to task_list.json or reopen existing tasks.
+- If gaps exist, add new tasks to task_list.json.
 - If everything matches the spec, do not add tasks.
+- Propose integration test tasks when behavior crosses components or external boundaries.
+- Integration test tasks should include steps to add tests, run them, fix failures, and rerun.
 
 STRICT RULES:
 - Do NOT change product code. Only update task_list.json and agent-progress.txt.
 - Be concrete: each task must have clear steps to verify.
-- Avoid duplicates; reuse/reopen existing tasks when appropriate.
-- Ensure any new task id is unique within task_list.json; if it collides, reopen or choose a new id.
+- Avoid duplicates; create new tasks instead of editing existing ones.
+- Ensure any new task id is unique within task_list.json.
+- Preserve task_list.json ordering and key order; do not reformat or reorder existing tasks.
+- Append any new tasks to the end of task_list.json.
 
 At the end:
 - Append a concise entry to agent-progress.txt (aim for ~10 lines, one line per bullet)
   summarizing what you checked, tests/commands you ran, gaps you found, and how you
-  resolved them (or note unresolved).
-- Commit changes with a message like "Spec audit: <brief summary>".
+  resolved them (or note unresolved). Include a line with lens=${auditLens}.
+- Commit changes with a message like "Audit: <brief summary>".
 `;
   }
 
@@ -1321,6 +2079,11 @@ At the end:
    * INTERNAL: Run the planning agent once.
    */
   private async runPlanningAgent(): Promise<void> {
+    if (this.isCodexPrimary()) {
+      await this.runCodexPlanningAgent();
+      return;
+    }
+
     const options: Options = {
       ...this.buildBaseOptions("planning"),
       maxTurns: this.cfg.maxPlanningTurns,
@@ -1335,6 +2098,35 @@ At the end:
     await this.pushIfNeeded("planning");
   }
 
+  private async runCodexPlanningAgent(): Promise<void> {
+    logInfo("Harness", "Starting Codex planning agent session…");
+    const nonce = randomUUID();
+    const prompt = this.buildCodexPlanningPrompt(nonce);
+    const result = await this.runCodexAgentPrompt(
+      prompt,
+      "planning",
+      "CODEX_PLANNING_RESULT",
+      nonce
+    );
+
+    if (!result.passed) {
+      throw new Error("Codex planning agent reported failure");
+    }
+
+    const [hasTaskList, hasProgressLog, hasInit] = await Promise.all([
+      pathExists(this.paths.taskList),
+      pathExists(this.paths.progressLog),
+      pathExists(this.paths.initScript),
+    ]);
+    const taskListValid = hasTaskList ? await this.isTaskListValid() : false;
+
+    if (!hasTaskList || !hasProgressLog || !hasInit || !taskListValid) {
+      throw new Error("Planning artifacts missing or invalid after Codex planning run");
+    }
+
+    await this.pushIfNeeded("planning");
+  }
+
   /**
    * INTERNAL: Core wrapper around Agent SDK query() with streaming + logging.
    * Throws an error if the SDK returns a non-success result.
@@ -1346,23 +2138,77 @@ At the end:
   ): Promise<void> {
     const stream = query({ prompt, options });
     let lastResult: SDKMessage | null = null;
+    let sawPromptTooLong = false;
 
-    for await (const msg of stream) {
-      this.defaultLogMessage(msg, phase);
-      this.cfg.onMessage?.(msg, phase);
+    try {
+      for await (const msg of stream) {
+        this.defaultLogMessage(msg, phase);
+        this.cfg.onMessage?.(msg, phase);
 
-      if (msg.type === "result") {
-        lastResult = msg;
+        if (msg.type === "assistant") {
+          const content = (msg.message as any).content ?? [];
+          for (const block of content) {
+            if (block?.type === "text" && typeof block.text === "string") {
+              if (this.isPromptTooLongText(block.text)) {
+                sawPromptTooLong = true;
+              }
+            }
+          }
+        }
+
+        if (msg.type === "result") {
+          lastResult = msg;
+        }
       }
+    } catch (err) {
+      const errMsg = err instanceof Error ? err.message : String(err);
+      if (sawPromptTooLong || this.isPromptTooLongText(errMsg)) {
+        throw new Error(`[${phase}] Prompt is too long`);
+      }
+      throw err;
     }
 
     // Check for SDK errors after the stream completes
     if (lastResult && lastResult.type === "result" && lastResult.subtype !== "success") {
       const errorMsg = lastResult.errors?.join("; ") ?? "Unknown error";
+      if (sawPromptTooLong || this.isPromptTooLongText(errorMsg)) {
+        throw new Error(`[${phase}] Prompt is too long`);
+      }
       throw new Error(
         `[${phase}] SDK query failed (${lastResult.subtype}): ${errorMsg}`
       );
     }
+  }
+
+  private async runCodexAgentPrompt(
+    prompt: string,
+    phase: HarnessPhase,
+    marker: string,
+    nonce: string
+  ): Promise<CodexAgentResult> {
+    const model = this.cfg.codexModel;
+    const { agentMessages, exitCode } = await this.execCodexJson(
+      prompt,
+      phase,
+      model,
+      phase,
+      this.getCodexLogMode(),
+      [marker]
+    );
+
+    const output = agentMessages.join("\n");
+    if (!output.trim()) {
+      throw new Error(`Codex ${phase} produced no agent messages`);
+    }
+    const payload = this.parseCodexAgentResult(output, marker, nonce);
+    const result = this.normalizeCodexResult(payload.result);
+    const passed = result === "PASS" && exitCode === 0;
+
+    if (!passed) {
+      logWarn("Harness", `Codex ${phase} result=${result} exitCode=${exitCode}`);
+    }
+
+    return { passed, payload, exitCode, output };
   }
 
   /**
@@ -1377,25 +2223,55 @@ At the end:
     const stream = query({ prompt, options });
     let lastResult: SDKMessage | null = null;
     let sessionId: string | null = null;
+    let sawPromptTooLong = false;
 
-    for await (const msg of stream) {
-      this.defaultLogMessage(msg, phase);
-      this.cfg.onMessage?.(msg, phase);
+    try {
+      for await (const msg of stream) {
+        this.defaultLogMessage(msg, phase);
+        this.cfg.onMessage?.(msg, phase);
 
-      // Capture session ID from any message
-      if ("session_id" in msg && msg.session_id && !sessionId) {
-        sessionId = msg.session_id;
+        // Capture session ID from any message
+        if ("session_id" in msg && msg.session_id && !sessionId) {
+          sessionId = msg.session_id;
+        }
+
+        if (msg.type === "assistant") {
+          const content = (msg.message as any).content ?? [];
+          for (const block of content) {
+            if (block?.type === "text" && typeof block.text === "string") {
+              if (this.isPromptTooLongText(block.text)) {
+                sawPromptTooLong = true;
+              }
+            }
+          }
+        }
+
+        if (msg.type === "result") {
+          lastResult = msg;
+        }
       }
-
-      if (msg.type === "result") {
-        lastResult = msg;
+    } catch (err) {
+      const errMsg = err instanceof Error ? err.message : String(err);
+      if (sawPromptTooLong || this.isPromptTooLongText(errMsg)) {
+        const errors = this.isPromptTooLongText(errMsg)
+          ? [errMsg]
+          : ["prompt is too long", errMsg];
+        return { sessionId, success: false, errors, errorSubtype: "exception" };
       }
+      throw err;
     }
 
     const success = lastResult?.type === "result" && lastResult.subtype === "success";
     const errorSubtype = lastResult?.type === "result" ? lastResult.subtype : undefined;
-    const errors = lastResult?.type === "result" ? lastResult.errors ?? [] : undefined;
-    log("Harness", `[${phase}] Session ended. success=${success}, lastResult.type=${lastResult?.type}, lastResult.subtype=${(lastResult as any)?.subtype}`);
+    // Only non-success results have errors
+    let errors: string[] | undefined = 
+      lastResult?.type === "result" && lastResult.subtype !== "success"
+        ? (lastResult as { errors?: string[] }).errors ?? []
+        : undefined;
+    if (!success && (errors === undefined || errors.length === 0) && sawPromptTooLong) {
+      errors = ["prompt is too long"];
+    }
+    logInfo("Harness", `[${phase}] Session ended. success=${success}, lastResult.type=${lastResult?.type}, lastResult.subtype=${(lastResult as any)?.subtype}`);
     return { sessionId, success, errors, errorSubtype };
   }
 
@@ -1429,7 +2305,7 @@ At the end:
 
     const reviewOptions: Options = {
       ...options,
-      maxTurns: this.cfg.maxReviewTurns ?? 100,
+      maxTurns: this.cfg.maxReviewTurns ?? DEFAULT_MAX_REVIEW_TURNS,
       ...(existingSessionId ? { resume: existingSessionId } : {}),
     };
 
@@ -1468,28 +2344,24 @@ At the end:
    * Uses the LAST occurrence of REVIEW_RESULT since prompts may be echoed.
    */
   private parseReviewResult(text: string): { passed: boolean; issues: string[] } {
-    const sentinelMatches = [...text.matchAll(/<<<CODEX_REVIEW_RESULT:([a-zA-Z0-9-]+)>>>\s*([\s\S]*?)\s*<<<END_CODEX_REVIEW_RESULT:\1>>>/g)];
-    if (sentinelMatches.length > 0) {
-      const lastSentinel = sentinelMatches[sentinelMatches.length - 1];
-      const payloadRaw = (lastSentinel[2] ?? "").trim();
-      try {
-        const payload = JSON.parse(payloadRaw);
-        const result =
-          typeof payload?.result === "string"
-            ? payload.result.trim().toUpperCase()
-            : "";
-        if (result === "PASS") {
-          return { passed: true, issues: [] };
-        }
-        if (result === "FAIL") {
-          const issues = Array.isArray(payload?.issues)
-            ? payload.issues.map((issue: unknown) => String(issue)).filter((issue: string) => issue.trim().length > 0)
-            : [];
-          return { passed: false, issues: issues.length > 0 ? issues : ["Review failed (no specific issues listed)"] };
-        }
-      } catch {
-        // Fall through to legacy parsing.
+    try {
+      const payloadRaw = this.extractCodexJson(text, "CODEX_REVIEW_RESULT");
+      const payload = JSON.parse(payloadRaw);
+      const result =
+        typeof payload?.result === "string"
+          ? payload.result.trim().toUpperCase()
+          : "";
+      if (result === "PASS") {
+        return { passed: true, issues: [] };
       }
+      if (result === "FAIL") {
+        const issues = Array.isArray(payload?.issues)
+          ? payload.issues.map((issue: unknown) => String(issue)).filter((issue: string) => issue.trim().length > 0)
+          : [];
+        return { passed: false, issues: issues.length > 0 ? issues : ["Review failed (no specific issues listed)"] };
+      }
+    } catch {
+      // Fall through to legacy parsing.
     }
 
     // Find ALL occurrences of REVIEW_RESULT and use the LAST one
@@ -1561,20 +2433,24 @@ At the end:
     return { passed: false, issues: ["No explicit REVIEW_RESULT found"] };
   }
 
+  private isPromptTooLongText(text: string): boolean {
+    const lowered = text.toLowerCase();
+    return (
+      lowered.includes("prompt is too long") ||
+      lowered.includes("context length") ||
+      lowered.includes("maximum context") ||
+      lowered.includes("max tokens") ||
+      lowered.includes("too many tokens") ||
+      lowered.includes("prompt too large")
+    );
+  }
+
   private isPromptTooLong(result: SessionResult): boolean {
     const errors = result.errors ?? [];
     if (errors.length === 0) {
       return false;
     }
-    const combined = errors.join(" ").toLowerCase();
-    return (
-      combined.includes("prompt is too long") ||
-      combined.includes("context length") ||
-      combined.includes("maximum context") ||
-      combined.includes("max tokens") ||
-      combined.includes("too many tokens") ||
-      combined.includes("prompt too large")
-    );
+    return errors.some((error) => this.isPromptTooLongText(error));
   }
 
   private async writeReviewIssues(
@@ -1604,7 +2480,7 @@ At the end:
     try {
       await fs.mkdir(reviewDir, { recursive: true });
       await fs.writeFile(issuesPath, content, "utf8");
-      log("Harness", `Saved review issues to ${issuesPath}`);
+      logInfo("Harness", `Saved review issues to ${issuesPath}`);
       return issuesPath;
     } catch (err) {
       logWarn("Harness", "Failed to write review issues file", err);
@@ -1626,88 +2502,43 @@ At the end:
       : this.buildCodexReviewPrompt(task, reviewNonce);
 
     const model = this.cfg.codexModel;
-    log("Harness", `Running Codex CLI review (model=${model ?? "default"}, task=${task.id})`);
-
-    const args = ["exec"];
-    if (model) {
-      args.push("-m", model);
-    }
-    // Use --dangerously-bypass-approvals-and-sandbox since Modal is already sandboxed
-    args.push("--dangerously-bypass-approvals-and-sandbox", "--skip-git-repo-check", prompt);
-
-    return new Promise((resolve) => {
-      const proc = spawn("codex", args, {
-        cwd: this.workingDir,
-        env: {
-          ...process.env,
-          GIT_DIR: path.join(this.workingDir, ".git"),
-        },
-        stdio: ["pipe", "pipe", "pipe"],
-      });
-
-      let stdout = "";
-      let stderr = "";
-
-      // Filter to only log interesting lines (not full diffs/command output)
-      const shouldLog = (line: string): boolean => {
-        const trimmed = line.trim();
-        if (!trimmed) return false;
-        // Always show these
-        if (trimmed.startsWith("thinking")) return true;
-        if (trimmed.startsWith("**")) return true;  // thinking summaries
-        if (trimmed.includes("CODEX_REVIEW_RESULT") || trimmed.includes("END_CODEX_REVIEW_RESULT")) return false;
-        if (/^\d+\.\s/.test(trimmed)) return false;
-        if (trimmed.includes("ISSUES:") || trimmed.includes("VERIFIED:")) return true;
-        if (trimmed.startsWith("- ") && (stdout.includes("ISSUES:") || stdout.includes("VERIFIED:"))) return true;
-        if (trimmed.includes("error") || trimmed.includes("Error") || trimmed.includes("failed")) return true;
-        // Skip diff lines, file content, etc.
-        return false;
-      };
-
-      proc.stdout.on("data", (data: Buffer) => {
-        const text = data.toString();
-        stdout += text;
-        for (const line of text.split("\n")) {
-          if (shouldLog(line)) {
-            log("review", `codex: ${line.trim()}`);
-          }
-        }
-      });
-
-      proc.stderr.on("data", (data: Buffer) => {
-        const text = data.toString();
-        stderr += text;
-        for (const line of text.split("\n")) {
-          if (shouldLog(line)) {
-            log("review", `codex: ${line.trim()}`);
-          }
-        }
-      });
-
-      proc.on("close", (code) => {
-        void (async () => {
-          if (code !== 0) {
-            logError("Harness", `Codex CLI exited with code ${code}`);
-          }
-
-          // Parse the review result from codex output
-          const { passed, issues } = this.parseReviewResult(stdout + stderr);
-          const issuesPath = passed ? null : await this.writeReviewIssues(task, issues, "codex");
-          log("review", `codex: result ${passed ? "PASS" : "FAIL"}${issues.length ? ` (${issues.length} issue(s))` : ""}`);
-
-          resolve({ sessionId: null, passed, issues, issuesPath });
-        })();
-      });
-
-      proc.on("error", (err) => {
-        logError("Harness", "Codex CLI spawn error", err);
-        resolve({
+    logInfo("Harness", `Running Codex CLI review (model=${model ?? "default"}, task=${task.id})`);
+    try {
+      const { agentMessages, exitCode } = await this.execCodexJson(
+        prompt,
+        "review",
+        model,
+        "review",
+        this.getCodexLogMode(),
+        ["CODEX_REVIEW_RESULT"]
+      );
+      const output = agentMessages.join("\n");
+      if (!output.trim()) {
+        return {
           sessionId: null,
           passed: false,
-          issues: [`Codex CLI spawn failed: ${err.message}`],
-        });
-      });
-    });
+          issues: ["Codex review produced no output"],
+        };
+      }
+
+      let { passed, issues } = this.parseReviewResult(output);
+      if (exitCode !== 0 && passed) {
+        passed = false;
+        issues = ["Codex review exited with a non-zero status"];
+      }
+
+      const issuesPath = passed ? null : await this.writeReviewIssues(task, issues, "codex");
+      logInfo("review", `codex: result ${passed ? "PASS" : "FAIL"}${issues.length ? ` (${issues.length} issue(s))` : ""}`);
+
+      return { sessionId: null, passed, issues, issuesPath };
+    } catch (err) {
+      logError("Harness", "Codex CLI review error", err);
+      return {
+        sessionId: null,
+        passed: false,
+        issues: [`Codex CLI review failed: ${err instanceof Error ? err.message : String(err)}`],
+      };
+    }
   }
 
   /**
@@ -1729,6 +2560,8 @@ REVIEW CHECKLIST:
 2. Verify the implementation meets the task description
 
 3. Look for obvious issues (bugs, missing error handling, incomplete implementation)
+
+4. Simplicity check: unnecessary complexity, over-abstraction, confusing names
 
 REVIEW GUIDELINES:
 - Focus on correctness: does the code do what the task asks?
@@ -1755,6 +2588,7 @@ Re-verify:
 1. Run: git status and git diff to see current changes
 2. Check if each issue you raised has been addressed
 3. Look for any NEW issues introduced by the fixes
+4. Simplicity check: unnecessary complexity, over-abstraction, confusing names
 
 Same guidelines: trust tests ran, fix minor issues yourself, only re-run if suspicious.
 
@@ -1782,13 +2616,25 @@ Return EXACTLY one block with valid JSON between the markers. Do not include any
 ${passActions}`;
   }
 
+  private buildCodexAgentOutputFormat(marker: string, nonce: string): string {
+    return `OUTPUT FORMAT (MACHINE READABLE ONLY):
+
+Return EXACTLY one block with valid JSON between the markers. Do not include any other text.
+This output format overrides any earlier instructions about response formatting.
+Use "PASS" only if all instructions above are completed and any required verification succeeded.
+
+<<<${marker}:${nonce}>>>
+{"result":"<PASS|FAIL>","notes":["<short notes>"],"tests":["<tests you ran>"]}
+<<<END_${marker}:${nonce}>>>`;
+  }
+
   /**
    * Ensure local working directory matches the remote GitHub repository if configured.
    * Clones when missing; otherwise fetches + hard resets to origin/<branch>.
    * Handles empty repos by initializing them locally first.
    */
   private async syncRepoFromRemote(): Promise<void> {
-    log("Harness", `Syncing from remote: ${this.repositoryUrl} (branch: ${this.branch})`);
+    logInfo("Harness", `Syncing from remote: ${this.repositoryUrl} (branch: ${this.branch})`);
     await this.ensureRemoteRepoExists();
     const repoExists = await pathExists(this.paths.gitDir);
 
@@ -1812,7 +2658,7 @@ ${passActions}`;
     const authUrl = this.getAuthenticatedRepoUrl();
 
     if (!repoExists) {
-      log("Harness", `No local repo at ${this.workingDir}, cloning...`);
+      logInfo("Harness", `No local repo at ${this.workingDir}, cloning...`);
       await fs.mkdir(this.workingDir, { recursive: true });
 
       // Try to clone; if it fails due to empty repo, initialize locally
@@ -1823,24 +2669,24 @@ ${passActions}`;
         );
         // Set the remote to the non-authenticated URL for display purposes
         await this.execGit(["-C", this.workingDir, "remote", "set-url", "origin", this.repositoryUrl], env);
-        log("Harness", `✓ Cloned repository successfully`);
+        logInfo("Harness", `✓ Cloned repository successfully`);
         return;
       } catch (err: any) {
         const msg = err?.message ?? "";
         // Handle empty repo (no branches yet)
         if (msg.includes("Remote branch") && msg.includes("not found")) {
-          log("Harness", "Remote repo is empty, initializing locally...");
+          logInfo("Harness", "Remote repo is empty, initializing locally...");
           await execFileAsync("git", ["init"], { cwd: this.workingDir, env });
           await execFileAsync("git", ["remote", "add", "origin", this.repositoryUrl], { cwd: this.workingDir, env });
           await execFileAsync("git", ["checkout", "-b", branchRef], { cwd: this.workingDir, env });
-          log("Harness", `✓ Initialized empty local repo`);
+          logInfo("Harness", `✓ Initialized empty local repo`);
           return;
         }
         throw err;
       }
     }
 
-    log("Harness", `Local repo exists, fetching and resetting to origin/${branchRef}...`);
+    logInfo("Harness", `Local repo exists, fetching and resetting to origin/${branchRef}...`);
     // Update remote URL to authenticated version for fetch
     await this.execGit(["-C", this.workingDir, "remote", "set-url", "origin", authUrl], env);
     try {
@@ -1856,7 +2702,7 @@ ${passActions}`;
       await this.execGit(["-C", this.workingDir, "checkout", "-B", branchRef, remoteRef], env);
       await this.execGit(["-C", this.workingDir, "reset", "--hard", remoteRef], env);
       await this.execGit(["-C", this.workingDir, "clean", "-fd"], env);
-      log("Harness", `✓ Synced to origin/${branchRef}`);
+      logInfo("Harness", `✓ Synced to origin/${branchRef}`);
     } catch (err: any) {
       const msg = err?.message ?? "";
       const isTaskBranch = branchRef.startsWith("task/");
@@ -1875,7 +2721,7 @@ ${passActions}`;
 
         const heads = await this.execGit(["-C", this.workingDir, "ls-remote", "--heads", "origin"], env);
         if (!heads.trim()) {
-          log("Harness", "Remote repo has no branches; reinitializing local repo...");
+          logInfo("Harness", "Remote repo has no branches; reinitializing local repo...");
           await this.resetToEmptyRepo(branchRef, env);
           return;
         }
@@ -1950,9 +2796,38 @@ ${passActions}`;
     }
   }
 
+  private async appendAutoCommitNote(
+    phase: HarnessPhase,
+    context: AutoCommitContext
+  ): Promise<void> {
+    if (context.result === "PASS") return;
+    if (phase !== "working" && phase !== "fixing") return;
+
+    const taskLabel = context.taskId ?? "unknown";
+    const outcome = context.result ?? "FAIL";
+    const reason = context.reason
+      ? truncateText(context.reason, 200)
+      : "Agent did not report PASS before session ended.";
+    const entry = [
+      `[${new Date().toISOString()}] Auto-commit note (${phase})`,
+      `- Task: ${taskLabel}`,
+      `- Outcome: ${outcome}`,
+      `- ${reason}`,
+      "- Auto-commit created by harness for uncommitted changes.",
+      `- Next session: review the "Auto-commit uncommitted changes (${phase})" commit before resuming.`,
+      "",
+    ].join("\n");
+
+    try {
+      await fs.appendFile(this.paths.progressLog, entry, "utf8");
+    } catch (err) {
+      logWarn("Harness", "Failed to append auto-commit note to agent-progress.txt", err);
+    }
+  }
+
   /** Push any unpushed commits to origin/<branch>. */
-  private async pushIfNeeded(phase: HarnessPhase): Promise<void> {
-    log("Harness", `Checking for unpushed commits (${phase})...`);
+  private async pushIfNeeded(phase: HarnessPhase, context?: AutoCommitContext): Promise<void> {
+    logInfo("Harness", `Checking for unpushed commits (${phase})...`);
     const needsToken = this.requiresGithubToken(this.repositoryUrl);
     if (needsToken && !this.gitToken) {
       throw new Error(
@@ -1967,11 +2842,14 @@ ${passActions}`;
       const status = await execFileAsync("git", ["-C", this.workingDir, "status", "--porcelain"], { env });
       const uncommitted = status.stdout.trim();
       if (uncommitted) {
+        if (context?.result && context.result !== "PASS") {
+          await this.appendAutoCommitNote(phase, context);
+        }
         logWarn("Harness", "Found uncommitted changes, auto-committing...");
         await this.ensureGitIdentity(env);
         await execFileAsync("git", ["-C", this.workingDir, "add", "-A"], { env });
         await execFileAsync("git", ["-C", this.workingDir, "commit", "-m", `Auto-commit uncommitted changes (${phase})`], { env });
-        log("Harness", `Auto-committed uncommitted changes`);
+        logInfo("Harness", `Auto-committed uncommitted changes`);
       }
     } catch (err) {
       logWarn("Harness", "Failed to check/commit uncommitted changes", err);
@@ -1982,9 +2860,9 @@ ${passActions}`;
     try {
       const result = await execFileAsync("git", ["-C", this.workingDir, "rev-parse", "HEAD"], { env });
       headSha = result.stdout.trim();
-      log("Harness", `Current HEAD: ${headSha}`);
+      logInfo("Harness", `Current HEAD: ${headSha}`);
     } catch {
-      log("Harness", `No commits yet, nothing to push.`);
+      logInfo("Harness", `No commits yet, nothing to push.`);
       return;
     }
 
@@ -1999,38 +2877,38 @@ ${passActions}`;
         { env }
       );
       unpushedCommits = result.stdout.trim().split("\n").filter(Boolean);
-      log("Harness", `Unpushed commits: ${unpushedCommits.length}`);
+      logInfo("Harness", `Unpushed commits: ${unpushedCommits.length}`);
       for (const commit of unpushedCommits) {
-        log("Harness", `  - ${commit}`);
+        logInfo("Harness", `  - ${commit}`);
       }
     } catch {
       // origin/<branch> doesn't exist yet, so all local commits are unpushed
-      log("Harness", `Remote branch origin/${this.branch} not found, all commits are unpushed`);
+      logInfo("Harness", `Remote branch origin/${this.branch} not found, all commits are unpushed`);
       unpushedCommits = ["all"];
     }
 
     if (unpushedCommits.length === 0) {
-      log("Harness", `No unpushed commits after ${phase} phase.`);
+      logInfo("Harness", `No unpushed commits after ${phase} phase.`);
       return;
     }
 
     // Pull (rebase) then push to origin
     const authUrl = this.getAuthenticatedRepoUrl();
-    log("Harness", `Pushing to origin/${this.branch}...`);
+    logInfo("Harness", `Pushing to origin/${this.branch}...`);
     try {
       await this.execGit(["-C", this.workingDir, "remote", "set-url", "origin", authUrl], env);
       // First, try to pull with rebase in case remote has new commits
       try {
-        log("Harness", `Attempting pull --rebase first...`);
+        logInfo("Harness", `Attempting pull --rebase first...`);
         await this.execGit(["-C", this.workingDir, "pull", "--rebase", "origin", this.branch], env);
       } catch (pullErr) {
         // Pull may fail if remote branch doesn't exist yet, that's OK
-        log("Harness", `Pull --rebase skipped or failed (may be expected): ${pullErr instanceof Error ? pullErr.message : pullErr}`);
+        logInfo("Harness", `Pull --rebase skipped or failed (may be expected): ${pullErr instanceof Error ? pullErr.message : pullErr}`);
       }
       // Use -u to set upstream if this is the first push
-      log("Harness", `Executing push...`);
+      logInfo("Harness", `Executing push...`);
       await this.execGit(["-C", this.workingDir, "push", "-u", "origin", this.branch], env);
-      log("Harness", `✓ Successfully pushed ${unpushedCommits.length} commit(s) to origin/${this.branch} (${phase}).`);
+      logInfo("Harness", `✓ Successfully pushed ${unpushedCommits.length} commit(s) to origin/${this.branch} (${phase}).`);
     } catch (err) {
       logError("Harness", `✗ Failed to push to origin/${this.branch}`, err);
       throw new Error(
@@ -2188,7 +3066,7 @@ ${envInfo}`;
     }
 
     if (phase === "audit") {
-      return `You are a SPEC AUDITOR for a Looper-managed project.
+      return `You are an AUDITOR for a Looper-managed project.
 Your job is to check whether the implementation matches the project spec.
 Only update coordination artifacts (task_list.json, agent-progress.txt).
 Do NOT change product code. Work on branch ${this.branch}.
@@ -2306,6 +3184,14 @@ CRITICAL RULES:
 `;
   }
 
+  private buildCodexPlanningPrompt(nonce: string): string {
+    return this.wrapWithCodexOutputFormat(
+      this.buildPlanningPrompt(),
+      "CODEX_PLANNING_RESULT",
+      nonce
+    );
+  }
+
   /**
    * Prompt for working sessions.
    * @param isProjectSetup - If true, includes detailed scaffolding instructions
@@ -2344,8 +3230,9 @@ This means the project has NOT been scaffolded yet. Your job is to:
       ? ""
       : `
 3) Verify the environment
-   - Run "./init.sh --quick" (fast mode, ~30 seconds).
+   - Run "./init.sh --quick > .looper-init.log 2>&1" (fast mode, ~30 seconds).
    - If it fails, dedicate this session to fixing the environment first.
+     * Inspect ".looper-init.log" (e.g. "tail -n 200 .looper-init.log").
      * Repair dependencies, scripts, or configuration until init.sh succeeds.
      * Do NOT mark any tasks as passing while the environment is broken.
    - Once init.sh starts successfully, proceed with your task.
@@ -2375,6 +3262,7 @@ Your job in this session is to:
   3. Implement it end-to-end.
   4. Verify it thoroughly.
   5. Leave the environment in a clean, working state.
+  6. If you hit a bug or broken state, fix it immediately before proceeding.
 
 Follow this checklist strictly:
 
@@ -2382,6 +3270,7 @@ Follow this checklist strictly:
    - Run "pwd" to confirm the working directory.
    - Ensure the repo is on branch ${this.branch} and synced to origin/${this.branch}.
    - Read agent-progress.txt.
+   - If agent-progress.txt mentions an auto-commit or git log shows a recent "Auto-commit uncommitted changes" commit, review that diff before continuing.
    - Inspect recent git history (e.g. "git log --oneline -20").
    - Open task_list.json.
 
@@ -2454,7 +3343,7 @@ Important constraints:
   investigation task and move on. Don't abandon libraries for hacky workarounds.
 - If you discover missing features/prerequisites: fix them now if feasible, otherwise
   add them as new tasks in task_list.json with "passes": false and move on.
-  Ensure new task ids do not collide with existing ones; reopen or rename if needed.
+  Ensure new task ids do not collide with existing ones; pick a new id if needed.
 - Do NOT redefine task requirements to claim success:
     * "Identical failures" is NOT "identical behavior" - things must actually work
     * If a task says "produce and consume records", records must actually be produced and consumed
@@ -2469,15 +3358,104 @@ Begin by summarizing what you see in the repo and which task you plan to tackle.
 `;
   }
 
-  /**
-   * Build the working prompt for review mode - implementation without marking complete.
-   */
-  private buildWorkingPromptForReview(isProjectSetup: boolean, task: TaskSpec): string {
-    const basePrompt = this.buildWorkingPrompt(isProjectSetup, task);
-
-    // Append a strong override at the end - more robust than regex replacement
+  /** Wrap a prompt with Codex output format instructions. */
+  private wrapWithCodexOutputFormat(basePrompt: string, marker: string, nonce: string): string {
     return `${basePrompt}
 
+At the end of your work, output the result in the exact format below.
+
+${this.buildCodexAgentOutputFormat(marker, nonce)}
+`;
+  }
+
+  private buildCodexWorkingPrompt(
+    isProjectSetup: boolean,
+    task: TaskSpec | undefined,
+    nonce: string
+  ): string {
+    return this.wrapWithCodexOutputFormat(
+      this.buildWorkingPrompt(isProjectSetup, task),
+      "CODEX_WORKING_RESULT",
+      nonce
+    );
+  }
+
+  private buildCodexWorkingPromptForReview(
+    isProjectSetup: boolean,
+    task: TaskSpec,
+    nonce: string
+  ): string {
+    return this.wrapWithCodexOutputFormat(
+      this.buildWorkingPromptForReview(isProjectSetup, task),
+      "CODEX_WORKING_RESULT",
+      nonce
+    );
+  }
+
+  private buildCodexFixPrompt(
+    issues: string[],
+    issuesPath: string | null | undefined,
+    nonce: string
+  ): string {
+    return this.wrapWithCodexOutputFormat(
+      this.buildFixPrompt(issues, issuesPath),
+      "CODEX_WORKING_RESULT",
+      nonce
+    );
+  }
+
+  private buildCompactWorkingPrompt(isProjectSetup: boolean, task?: TaskSpec): string {
+    const taskAssignment = task
+      ? `
+ASSIGNED TASK: ${task.id}
+Description: ${task.description}
+Steps:
+${task.steps.map((s, i) => `  ${i + 1}. ${s}`).join("\n")}
+`
+      : "";
+
+    const projectSetupSection = isProjectSetup
+      ? `
+Project-setup:
+- Choose and scaffold a sensible stack.
+- Update init.sh to install dependencies and run a smoke test.
+- Ensure ./init.sh passes before finishing.
+`
+      : "";
+
+    const verifyEnvironmentSection = isProjectSetup
+      ? ""
+      : `
+Environment:
+- Run "./init.sh --quick > .looper-init.log 2>&1".
+- If it fails, check "tail -n 200 .looper-init.log".
+- If it fails, fix the environment before the task.
+`;
+
+    return `
+You are a working agent on a long-running project.
+${taskAssignment}${projectSetupSection}
+Keep context small:
+- Avoid dumping large files or logs.
+- Use rg/jq/sed with limits (head/tail) for big files.
+- Only read the portions you need.
+
+Key files at repo root: CLAUDE.md, SPEC.md, task_list.json, agent-progress.txt, init.sh.
+If agent-progress.txt mentions an auto-commit or git log shows "Auto-commit uncommitted changes", review that diff before continuing.
+${verifyEnvironmentSection}
+Implement the task end-to-end and verify using the task steps.
+
+Finish:
+- Update task_list.json to mark the task passing.
+- Update agent-progress.txt with a concise entry.
+- Commit with a focused message.
+
+Explain what you changed and list commands you ran.
+`;
+  }
+
+  /** Review mode suffix - full version with detailed instructions. */
+  private readonly REVIEW_MODE_SUFFIX_FULL = `
 ═══════════════════════════════════════════════════════════════════════════════
 CRITICAL OVERRIDE - REVIEW MODE ACTIVE
 ═══════════════════════════════════════════════════════════════════════════════
@@ -2495,6 +3473,24 @@ DO:
 - Stage your changes with "git add" but DO NOT COMMIT
 - The review agent will verify, update task_list.json, and commit everything together
 ═══════════════════════════════════════════════════════════════════════════════`;
+
+  /** Review mode suffix - compact version. */
+  private readonly REVIEW_MODE_SUFFIX_COMPACT = `
+REVIEW MODE:
+- Do NOT edit task_list.json or agent-progress.txt.
+- Do NOT commit.
+- Stage changes with "git add".
+`;
+
+  /**
+   * Build the working prompt for review mode - implementation without marking complete.
+   */
+  private buildWorkingPromptForReview(isProjectSetup: boolean, task: TaskSpec): string {
+    return this.buildWorkingPrompt(isProjectSetup, task) + this.REVIEW_MODE_SUFFIX_FULL;
+  }
+
+  private buildCompactWorkingPromptForReview(isProjectSetup: boolean, task: TaskSpec): string {
+    return this.buildCompactWorkingPrompt(isProjectSetup, task) + this.REVIEW_MODE_SUFFIX_COMPACT;
   }
 
   /**
@@ -2530,7 +3526,7 @@ Rules:
 
 If you discover missing prerequisites: fix them now if feasible, otherwise add them
 as new tasks with "passes": false and move on to something you can complete.
-Ensure new task ids do not collide with existing ones; reopen or rename if needed.
+Ensure new task ids do not collide with existing ones; pick a new id if needed.
 
 After completing your work:
 - Stage your changes with "git add" but DO NOT COMMIT
@@ -2593,55 +3589,20 @@ You are an independent CODE REVIEWER auditing work on task: "${task.id}"
 
 Task description: ${task.description}
 
-You have NO context of how this was implemented. You must verify independently.
+No prior context. Changes are UNCOMMITTED (staged/unstaged), not commits.
 
-IMPORTANT: The working agent has left changes UNCOMMITTED for you to review.
-You will see staged/unstaged changes, not commits.
+Your job: find problems. Be skeptical.
 
-YOUR JOB IS TO FIND PROBLEMS. Be skeptical. Assume the implementation may be:
-- Incomplete (stubs, placeholders, TODOs left in code)
-- Untested (tests don't actually run, are ignored, or don't verify behavior)
-- Gaming metrics (marking things complete without real verification)
+REVIEW CHECKLIST:
+1) Inspect changes: git status; git diff --stat; git diff; git diff --cached
+2) Verify task requirements and behavior; watch for stubs/TODOs/missing error handling
+3) Simplicity check: unnecessary complexity, over-abstraction, confusing names, dead code
+4) Tests: run relevant tests unless clearly unrelated; confirm they actually execute
 
-AUDIT CHECKLIST:
-
-1. Check what changed (the working agent left changes uncommitted):
-   - Run: git status
-   - Run: git diff --stat
-   - Run: git diff (for unstaged) and git diff --cached (for staged)
-
-2. Look for cheating patterns:
-   - Run: grep -r "#\\[ignore\\]" on test files (tests that are skipped)
-   - Run: grep -r "TODO\\|FIXME\\|unimplemented\\|todo!" on changed files
-   - Check if tests use "--no-run" (compilation only, no execution)
-
-3. Actually run the tests:
-   - Find and run the relevant test command (cargo test, npm test, pytest, etc.)
-   - Verify tests ACTUALLY EXECUTE (not just compile)
-   - Check the output shows tests running and passing
-
-4. Verify the implementation:
-   - Does the code actually do what the task description says?
-   - Are there stub/placeholder implementations?
-   - Is error handling real or just "// TODO: handle errors"?
-
-5. Check for deferred work:
-   - "Ready to run" but never actually run
-   - "Infrastructure complete" but no actual functionality
-   - Tests that test infrastructure, not behavior
-
-RED FLAGS (automatic fail):
-- Tests marked #[ignore] that should run
-- "cargo test --no-run" used as verification
-- Stub implementations (unimplemented!(), todo!(), pass, ...)
-- TODOs in the implementation code
-- Tests that don't assert anything meaningful
-- "This will be implemented later" comments
-- Abandoning proper libraries for manual implementations without justification
-  (e.g., "had version issues" so switched to manual byte encoding)
-- Using old/deprecated API versions when modern ones should work
-- Redefining task requirements to claim success (e.g., "identical failures count as identical behavior")
-- Rationalizing that broken code meets requirements through creative interpretation
+RED FLAGS (fail):
+- Ignored/skipped tests or "--no-run"
+- Stubs (unimplemented!/todo!/placeholder)
+- Tests that don't assert behavior
 
 OUTPUT FORMAT (you MUST use this exact format at the end):
 
@@ -2658,16 +3619,12 @@ VERIFIED:
 - <what you verified>
 - <tests you ran and their output>
 
-Then, if PASS, you MUST do ALL of the following in ONE ATOMIC COMMIT:
+If PASS, do ALL in ONE ATOMIC COMMIT:
 1. Update task_list.json: set "passes": true for "${task.id}"
-2. Append to agent-progress.txt with a concise entry (aim for ~10 lines)
-   noting what you reviewed, what you verified/tests run, any issues found, and how
-   they were resolved (or note none).
+2. Append to agent-progress.txt with a concise entry (~10 lines)
 3. Stage ALL changes: git add -A
-4. Commit EVERYTHING together (implementation + task updates) with message:
+4. Commit EVERYTHING with message:
    "Complete ${task.id}: <brief description of what was implemented>"
-
-This ensures the implementation and task completion are in ONE commit, not separate commits.
 
 Begin your audit now.
 `;
@@ -2791,16 +3748,16 @@ If PASS, you MUST do ALL of the following in ONE ATOMIC COMMIT:
         }
       }
 
+      // Build properly typed TaskSpec after validation
       const task: TaskSpec = {
-        id: record.id,
-        category: record.category,
-        description: record.description,
+        id: record.id as string,
+        category: record.category as string,
+        description: record.description as string,
         steps: record.steps as string[],
-        passes: record.passes as boolean | undefined,
-        depends_on: record.depends_on as string[] | undefined,
-        scope: record.scope as string[] | undefined,
+        ...(record.passes !== undefined ? { passes: record.passes as boolean } : {}),
+        ...(record.depends_on !== undefined ? { depends_on: record.depends_on as string[] } : {}),
+        ...(record.scope !== undefined ? { scope: record.scope as string[] } : {}),
       };
-
       normalized.push(task);
       idCounts.set(task.id, (idCounts.get(task.id) ?? 0) + 1);
     }
@@ -2890,9 +3847,9 @@ If PASS, you MUST do ALL of the following in ONE ATOMIC COMMIT:
     switch (msg.type) {
       case "system":
         if (msg.subtype === "init") {
-          log(phase, `Session started (model=${msg.model}, permissionMode=${msg.permissionMode})`);
+          logInfo(phase, `Session started (model=${msg.model}, permissionMode=${msg.permissionMode})`);
         } else if (msg.subtype === "compact_boundary") {
-          log(phase, `--- context compacted (trigger=${msg.compact_metadata.trigger}, pre_tokens=${msg.compact_metadata.pre_tokens})`);
+          logInfo(phase, `--- context compacted (trigger=${msg.compact_metadata.trigger}, pre_tokens=${msg.compact_metadata.pre_tokens})`);
         }
         break;
 
@@ -2901,14 +3858,14 @@ If PASS, you MUST do ALL of the following in ONE ATOMIC COMMIT:
         const content = (msg.message as any).content ?? [];
         for (const block of content) {
           if (block?.type === "text" && typeof block.text === "string") {
-            log(phase, `assistant: ${block.text}`);
+            logInfo(phase, `assistant: ${block.text}`);
           } else if (block?.type === "tool_use") {
             // Log tool name and a brief summary of input
             const inputSummary = this.summarizeToolInput(block.name, block.input);
             if (inputSummary) {
-              log(phase, `tool: ${inputSummary}`);
+              logInfo(phase, `tool: ${inputSummary}`);
             } else {
-              log(phase, `tool: ${block.name}`);
+              logInfo(phase, `tool: ${block.name}`);
             }
           }
         }
@@ -2917,7 +3874,7 @@ If PASS, you MUST do ALL of the following in ONE ATOMIC COMMIT:
 
       case "result":
         if (msg.subtype === "success") {
-          log(phase, `✓ result: turns=${msg.num_turns}, duration=${msg.duration_ms}ms, cost=$${msg.total_cost_usd.toFixed(4)}`);
+          logInfo(phase, `✓ result: turns=${msg.num_turns}, duration=${msg.duration_ms}ms, cost=$${msg.total_cost_usd.toFixed(4)}`);
         } else {
           logWarn(
             phase,
@@ -2970,15 +3927,5 @@ If PASS, you MUST do ALL of the following in ONE ATOMIC COMMIT:
   /** Check for a sentinel file requesting shutdown after the current session. */
   private async shouldStopAfterSession(): Promise<boolean> {
     return pathExists(this.stopFilePath);
-  }
-}
-
-/** Simple helper to check if a path exists. */
-async function pathExists(p: string): Promise<boolean> {
-  try {
-    await fs.access(p);
-    return true;
-  } catch {
-    return false;
   }
 }

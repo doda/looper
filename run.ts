@@ -13,27 +13,31 @@
  *   --cpu <cores>          CPU cores (default: 4.0)
  *   --memory <mb>          Memory in MB (default: 16384)
  *   --timeout <secs>       Timeout in seconds (default: 3600)
- *   --continuous           After tasks complete, run a Codex spec audit and continue if new tasks are added
+ *   --idle-timeout <secs>  Idle timeout in seconds (default: 300)
+ *   --continuous           After tasks complete, run a Codex audit and continue if new tasks are added
  *   --spec-audit-max-areas <n> Max audit areas/reviewers (default: 10)
- *   --spec-audit-parallelism <n> Max parallel Codex reviewers (default: 3)
  *   --model <model>        Claude model: opus, sonnet (default: opus)
+ *   --primary-agent <a>   Primary agent for planning/working: claude, codex (default: codex)
  *   --claude-oauth-file <f> Path to Claude Code OAuth credentials JSON (default: ./.claude-code-credentials.json)
+ *   --enable-review        Enable review agent ping-pong (default: off)
  *
  * Environment:
  *   GITHUB_OWNER           Used to derive repo URL
  *   GITHUB_TOKEN           Required for private repos
  *   ANTHROPIC_API_KEY      Required if OAuth credentials not provided
+ *   Codex auth is loaded from ~/.codex/auth.json (run: codex auth login)
  */
 
 import "dotenv/config";
-import { ModalClient, type Sandbox } from "modal";
+import { ModalClient, type Sandbox, type SandboxFile } from "modal";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { pathToFileURL } from "node:url";
 import { LongRunningHarness, type LongRunningHarnessConfig } from "./harness.js";
-import { logError, logInfo, logWarn } from "./logger.js";
+import { logDebug, logError, logInfo, logWarn } from "./logger.js";
+import { pathExists, sleep } from "./utils.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -44,9 +48,12 @@ interface Config {
   cpu: number;
   memoryMb: number;
   timeoutSecs: number;
+  idleTimeoutSecs: number;
   repoUrl: string;
   branch: string;
   model: string;
+  primaryAgent?: "claude" | "codex";
+  enableReviewAgent?: boolean;
   githubToken?: string;
   anthropicApiKey?: string;
   claudeOAuthFile?: string;
@@ -58,16 +65,46 @@ interface Config {
   prompts?: LongRunningHarnessConfig["prompts"];
   continuous?: boolean;
   specAuditMaxAreas?: number;
-  specAuditParallelism?: number;
 }
 
-// Detect if running inside Modal sandbox
+// ─────────────────────────────────────────────────────────────────────────────
+// Constants
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Timeouts (in milliseconds)
+const MS_PER_SECOND = 1000;
+const MS_PER_MINUTE = 60 * MS_PER_SECOND;
+const MS_PER_HOUR = 60 * MS_PER_MINUTE;
+const DEFAULT_TIMEOUT_MS = 24 * MS_PER_HOUR;
+const DEFAULT_IDLE_TIMEOUT_MS = 60 * MS_PER_SECOND;
+const FORCE_EXIT_TIMEOUT_MS = 3 * MS_PER_SECOND;
+const GITHUB_API_TIMEOUT_MS = 30 * MS_PER_SECOND;
+const LOG_POLL_INTERVAL_MS = 2 * MS_PER_SECOND;
+const RENEWAL_AFTER_MS = 23 * MS_PER_HOUR;
+
+// File transfer limits
+const SMALL_FILE_B64_THRESHOLD = 50_000;
+const FILE_CHUNK_SIZE = 40_000;
+
+// Default sandbox resources
+const DEFAULT_CPU_CORES = 2.0;
+const DEFAULT_MEMORY_MB = 4096;
+
+// Paths and file patterns
 const IN_MODAL = process.env.__LOOPER_IN_MODAL === "1";
 const STOP_FILE_PATH = "/harness/.looper-stop-after-session";
 const HARNESS_STATIC_FILES = new Set(["package.json", "tsconfig.json"]);
+const DEFAULT_LOG_DIR = "/workspace/.looper";
+const FALLBACK_LOG_DIR = "/tmp/looper";
+const LOG_DIR_OVERRIDE = process.env.LOOPER_LOG_DIR;
 
-// Self-renewal: spawn successor sandbox before 24h timeout
-const RENEWAL_AFTER_MS = 23 * 60 * 60 * 1000; // 23 hours
+// Mutable log path state
+let activeLogDir = LOG_DIR_OVERRIDE ?? DEFAULT_LOG_DIR;
+let activeHarnessLogPath = path.posix.join(activeLogDir, "harness.log");
+let activeHarnessExitPath = path.posix.join(activeLogDir, "harness.exit");
+let activeHarnessPidPath = path.posix.join(activeLogDir, "harness.pid");
+let activeHarnessRunnerPath = path.posix.join(activeLogDir, "run-harness.sh");
+let logOpenFailures = 0;
 
 async function main() {
   if (IN_MODAL) {
@@ -80,16 +117,6 @@ async function main() {
 // ─────────────────────────────────────────────────────────────────────────────
 // Modal orchestration (runs locally)
 // ─────────────────────────────────────────────────────────────────────────────
-
-/** Simple helper to check if a path exists. */
-async function pathExists(p: string): Promise<boolean> {
-  try {
-    await fs.access(p);
-    return true;
-  } catch {
-    return false;
-  }
-}
 
 /**
  * Sync OAuth credentials from macOS Keychain if sync-credentials.sh exists.
@@ -131,9 +158,8 @@ async function syncCredentialsIfAvailable(oauthFile: string): Promise<boolean> {
   }
 }
 
-async function runInModal() {
-  const config = await parseArgs();
-
+/** Validate config and exit if invalid. */
+function validateConfig(config: Config): { primaryAgent: "claude" | "codex"; reviewAgent: "claude" | "codex"; enableReviewAgent: boolean } {
   if (!config.projectName || !config.instruction) {
     printUsage();
     process.exit(1);
@@ -144,22 +170,32 @@ async function runInModal() {
     process.exit(1);
   }
 
-  // Sync credentials if using OAuth and sync script is available
+  const primaryAgent = config.primaryAgent ?? "codex";
+  const reviewAgent = config.reviewAgent ?? "codex";
+  const enableReviewAgent = config.enableReviewAgent ?? false;
+  
+  if (primaryAgent === "codex" && reviewAgent === "claude") {
+    console.error("Error: --primary-agent codex cannot be used with --review-agent claude\n");
+    process.exit(1);
+  }
+
+  return { primaryAgent, reviewAgent, enableReviewAgent };
+}
+
+/** Load Claude credentials if needed. */
+async function loadClaudeCredentials(config: Config): Promise<void> {
   const oauthFile = config.claudeOAuthFile ?? "./.claude-code-credentials.json";
   if (config.claudeOAuthCredentials || await pathExists(oauthFile)) {
     await syncCredentialsIfAvailable(oauthFile);
-    // Re-read credentials after sync
     try {
       config.claudeOAuthCredentials = await fs.readFile(oauthFile, "utf8");
       config.claudeOAuthFile = oauthFile;
       JSON.parse(config.claudeOAuthCredentials);
     } catch (err) {
       if (config.claudeOAuthFile) {
-        // Explicit file was provided, fail if we can't read it
         console.error(`Error: Failed to read OAuth credentials from ${config.claudeOAuthFile}:`, err);
         process.exit(1);
       }
-      // Default file doesn't exist or invalid, will fall back to API key
     }
   }
 
@@ -173,84 +209,114 @@ async function runInModal() {
   } else {
     logInfo("Looper", "Using ANTHROPIC_API_KEY for authentication");
   }
+}
 
-  // Load Codex credentials for review (default reviewer)
-  if (config.reviewAgent !== "claude") {
-    const codexAuthPath = path.join(process.env.HOME ?? "", ".codex", "auth.json");
-    try {
-      config.codexCredentials = await fs.readFile(codexAuthPath, "utf8");
-      JSON.parse(config.codexCredentials); // Validate JSON
-      logInfo("Looper", `Using Codex credentials from ${codexAuthPath}`);
-    } catch (err) {
-      console.error(`Error: Codex review (default) requires auth at ${codexAuthPath}`);
-      console.error(`Please run: codex auth login`);
-      console.error(`Or use --review-agent claude to use Claude for review`);
-      process.exit(1);
+/** Load Codex credentials if needed. */
+async function loadCodexCredentials(config: Config, needsClaude: boolean): Promise<void> {
+  const codexAuthPath = path.join(process.env.HOME ?? "", ".codex", "auth.json");
+  try {
+    config.codexCredentials = await fs.readFile(codexAuthPath, "utf8");
+    JSON.parse(config.codexCredentials);
+    logInfo("Looper", `Using Codex credentials from ${codexAuthPath}`);
+  } catch (err) {
+    console.error(`Error: Codex requires auth at ${codexAuthPath}`);
+    console.error(`Please run: codex auth login`);
+    if (needsClaude) {
+      console.error(`Or use --primary-agent claude to use Claude as the primary agent`);
     }
+    process.exit(1);
   }
+}
 
+/** Build secret entries for the sandbox. */
+function buildSecretEntries(config: Config): Record<string, string> {
+  const entries: Record<string, string> = {};
+  if (config.githubToken) entries.GITHUB_TOKEN = config.githubToken;
+  if (config.anthropicApiKey && !config.claudeOAuthCredentials) {
+    entries.ANTHROPIC_API_KEY = config.anthropicApiKey;
+  }
+  if (config.claudeOAuthCredentials) {
+    entries.CLAUDE_CODE_CREDENTIALS_JSON = config.claudeOAuthCredentials;
+  }
+  if (config.codexCredentials) {
+    entries.CODEX_CREDENTIALS_JSON = config.codexCredentials;
+  }
+  if (process.env.MODAL_TOKEN_ID) {
+    entries.MODAL_TOKEN_ID = process.env.MODAL_TOKEN_ID;
+  }
+  if (process.env.MODAL_TOKEN_SECRET) {
+    entries.MODAL_TOKEN_SECRET = process.env.MODAL_TOKEN_SECRET;
+  }
+  return entries;
+}
+
+/** Handle existing running sandboxes. */
+async function handleExistingSandboxes(
+  client: ModalClient,
+  appId: string,
+  terminateExisting: boolean
+): Promise<void> {
+  const existingSandboxes: Sandbox[] = [];
+  for await (const sb of client.sandboxes.list({ appId })) {
+    existingSandboxes.push(sb);
+  }
+  
+  if (existingSandboxes.length === 0) return;
+
+  if (terminateExisting) {
+    logInfo("Looper", `Found ${existingSandboxes.length} running sandbox(es), terminating...`);
+    for (const sb of existingSandboxes) {
+      logInfo("Looper", `Terminating sandbox: ${sb.sandboxId}`);
+      try {
+        await sb.terminate();
+      } catch (err) {
+        logWarn("Looper", `Failed to terminate ${sb.sandboxId}`, err);
+      }
+    }
+    logInfo("Looper", "Existing sandboxes terminated.");
+  } else {
+    logError("Looper", `ERROR: Found ${existingSandboxes.length} running sandbox(es) for this project:`);
+    for (const sb of existingSandboxes) {
+      logError("Looper", `  - ${sb.sandboxId}`);
+    }
+    logError("Looper", "\nConcurrent runs against the same volume will cause conflicts.");
+    logError("Looper", "Either wait for the existing run to complete, or use --terminate to stop it.\n");
+    process.exit(1);
+  }
+}
+
+async function runInModal() {
+  const config = await parseArgs();
+  const { primaryAgent, reviewAgent, enableReviewAgent } = validateConfig(config);
+
+  // Load credentials based on agent requirements
+  const reviewOrAuditEnabled = enableReviewAgent || Boolean(config.continuous);
+  const needsClaude = primaryAgent === "claude" || (reviewOrAuditEnabled && reviewAgent === "claude");
+  const needsCodex = primaryAgent === "codex" || (reviewOrAuditEnabled && reviewAgent === "codex");
+
+  if (needsClaude) await loadClaudeCredentials(config);
+  if (needsCodex) await loadCodexCredentials(config, needsClaude);
+
+  // Log configuration
   logInfo("Looper", `Project: ${config.projectName}`);
   logInfo("Looper", `Repo: ${config.repoUrl} (branch ${config.branch})`);
   logInfo("Looper", `Model: ${config.model}`);
+  logInfo("Looper", `Primary agent: ${primaryAgent}`);
+  logInfo("Looper", `Review enabled: ${enableReviewAgent ? "yes" : "no"}`);
   logInfo("Looper", `Sessions: ${config.sessions || "unlimited"}`);
   logInfo("Looper", `Modal credentials: ${process.env.MODAL_TOKEN_ID ? "available" : "not set"}`);
 
+  // Set up Modal resources
   const client = new ModalClient();
   const appName = `looper-${config.projectName}`;
   const volumeName = `${config.projectName}-volume`;
-
   const app = await client.apps.fromName(appName, { createIfMissing: true });
   const volume = await client.volumes.fromName(volumeName, { createIfMissing: true });
 
-  // Check for existing running sandboxes to prevent concurrent runs
-  const existingSandboxes: Sandbox[] = [];
-  for await (const sb of client.sandboxes.list({ appId: app.appId })) {
-    existingSandboxes.push(sb);
-  }
-  if (existingSandboxes.length > 0) {
-    if (config.terminateExisting) {
-      logInfo("Looper", `Found ${existingSandboxes.length} running sandbox(es), terminating...`);
-      for (const sb of existingSandboxes) {
-        logInfo("Looper", `Terminating sandbox: ${sb.sandboxId}`);
-        try {
-          await sb.terminate();
-        } catch (err) {
-          logWarn("Looper", `Failed to terminate ${sb.sandboxId}`, err);
-        }
-      }
-      logInfo("Looper", "Existing sandboxes terminated.");
-    } else {
-      logError("Looper", `ERROR: Found ${existingSandboxes.length} running sandbox(es) for this project:`);
-      for (const sb of existingSandboxes) {
-        logError("Looper", `  - ${sb.sandboxId}`);
-      }
-      logError("Looper", "\nConcurrent runs against the same volume will cause conflicts.");
-      logError("Looper", "Either wait for the existing run to complete, or use --terminate to stop it.\n");
-      process.exit(1);
-    }
-  }
+  await handleExistingSandboxes(client, app.appId, config.terminateExisting ?? false);
 
   const image = buildImage(client);
-
-  const secretEntries: Record<string, string> = {};
-  if (config.githubToken) secretEntries.GITHUB_TOKEN = config.githubToken;
-  if (config.anthropicApiKey && !config.claudeOAuthCredentials) {
-    secretEntries.ANTHROPIC_API_KEY = config.anthropicApiKey;
-  }
-  if (config.claudeOAuthCredentials) {
-    secretEntries.CLAUDE_CODE_CREDENTIALS_JSON = config.claudeOAuthCredentials;
-  }
-  if (config.codexCredentials) {
-    secretEntries.CODEX_CREDENTIALS_JSON = config.codexCredentials;
-  }
-  // Forward Modal credentials so the working agent can spawn sandboxes
-  if (process.env.MODAL_TOKEN_ID) {
-    secretEntries.MODAL_TOKEN_ID = process.env.MODAL_TOKEN_ID;
-  }
-  if (process.env.MODAL_TOKEN_SECRET) {
-    secretEntries.MODAL_TOKEN_SECRET = process.env.MODAL_TOKEN_SECRET;
-  }
-
+  const secretEntries = buildSecretEntries(config);
   const secrets = Object.keys(secretEntries).length > 0
     ? [await client.secrets.fromObject(secretEntries)]
     : [];
@@ -261,14 +327,18 @@ async function runInModal() {
   // Modal defaults to ~10 minutes if no timeout is provided. Treat 0 as "long timeout".
   const timeoutMs =
     config.timeoutSecs > 0
-      ? config.timeoutSecs * 1000
-      : 24 * 60 * 60 * 1000; // 24h fallback
+      ? config.timeoutSecs * MS_PER_SECOND
+      : DEFAULT_TIMEOUT_MS;
+  const idleTimeoutMs =
+    config.idleTimeoutSecs > 0
+      ? config.idleTimeoutSecs * MS_PER_SECOND
+      : undefined;
 
   const sandbox = await client.sandboxes.create(app, image, {
     cpu: config.cpu,
     memoryMiB: config.memoryMb,
     ...(timeoutMs ? { timeoutMs } : {}),
-    idleTimeoutMs: 60 * 1000,
+    ...(idleTimeoutMs ? { idleTimeoutMs } : {}),
     volumes: { "/workspace": volume },
     env: {
       __LOOPER_IN_MODAL: "1",
@@ -278,12 +348,14 @@ async function runInModal() {
       REPOSITORY_BRANCH: config.branch,
       REPOSITORY_BASE_BRANCH: config.branch,
       WORKSPACE_DIR: projectDir,
+      LOOPER_PRIMARY_AGENT: primaryAgent,
+      ...(enableReviewAgent ? { LOOPER_ENABLE_REVIEW: "1" } : {}),
       MAX_SESSIONS: String(config.sessions),
       ...(config.continuous ? { LOOPER_CONTINUOUS: "1" } : {}),
       ...(config.specAuditMaxAreas ? { LOOPER_SPEC_AUDIT_MAX_AREAS: String(config.specAuditMaxAreas) } : {}),
-      ...(config.specAuditParallelism ? { LOOPER_SPEC_AUDIT_PARALLELISM: String(config.specAuditParallelism) } : {}),
       MODEL: config.model,
       LOOPER_STOP_FILE: STOP_FILE_PATH,
+      LOOPER_IDLE_TIMEOUT_SECS: String(config.idleTimeoutSecs),
       // Playwright needs to find the browsers installed during image build
       PLAYWRIGHT_BROWSERS_PATH: "/home/looper/.cache/ms-playwright",
       ...(config.claudeOAuthCredentials ? { CLAUDE_CONFIG_DIR: "/home/looper/.config/claude" } : {}),
@@ -355,7 +427,7 @@ async function runInModal() {
       process.exit(1);
     });
     // Fallback: force exit after 3 seconds if terminate hangs
-    setTimeout(() => process.exit(1), 3000);
+    setTimeout(() => process.exit(1), FORCE_EXIT_TIMEOUT_MS);
   };
 
   process.on("SIGINT", handleSigint);
@@ -375,24 +447,24 @@ async function runInModal() {
     }
     logInfo("Looper", "Workspace ready. Starting harness...");
 
-    // Add echo to confirm command started, then run tsx
-    const cmd = `echo "[Looper] Harness process starting..." && sudo -E -u looper HOME=/home/looper npx tsx run.ts`;
-
+    const cmd = `sudo -E -u looper HOME=/home/looper stdbuf -oL -eL npx tsx run.ts`;
     console.log("─".repeat(60));
-    let result: { exitCode: number };
+    let exitCode = 1;
     try {
-      result = await exec(sandbox, cmd, "/harness", {
-        stream: true,
-        mirrorToSandboxLogs: true,
-      });
+      await startDetachedHarness(sandbox, cmd, "/harness");
+      try {
+        await startHarnessKeepalive(sandbox);
+      } catch (err) {
+        logWarn("Looper", "Failed to start keepalive process", err);
+      }
+      exitCode = await streamHarnessLogs(sandbox);
     } catch (execErr) {
-      logError("Looper", "Exec failed", execErr);
-      result = { exitCode: 1 };
+      logError("Looper", "Harness monitoring failed", execErr);
     }
     console.log("─".repeat(60));
-    logInfo("Looper", `Harness exited with code ${result.exitCode}`);
+    logInfo("Looper", `Harness exited with code ${exitCode}`);
 
-    process.exitCode = result.exitCode;
+    process.exitCode = exitCode;
   } finally {
     process.off("SIGINT", handleSigint);
     process.off("exit", cleanupOnExit);
@@ -424,7 +496,7 @@ async function runInModal() {
   }
 }
 
-function buildImage(client: ModalClient) {
+export function buildImage(client: ModalClient) {
   // Non-root user required: Claude SDK refuses bypassPermissions as root
   return client.images
     .fromRegistry("node:22-slim")
@@ -445,7 +517,7 @@ function buildImage(client: ModalClient) {
       "RUN mkdir -p /harness /workspace && chown -R looper:looper /harness /workspace",
       "USER looper",
       "ENV PATH=$PATH:/usr/local/go/bin:/home/looper/go/bin:/home/looper/.cargo/bin",
-      // Rust (for krafka and other Rust projects) - installed as looper user
+      // Rust - installed as looper user
       "RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable",
       // Install Playwright browser binaries as looper user
       "RUN npx -y playwright@latest install chromium",
@@ -496,13 +568,13 @@ async function writeFileToSandbox(sandbox: Sandbox, filePath: string, content: s
   const b64 = Buffer.from(content).toString("base64");
   
   // For small files, use simple echo
-  if (b64.length < 50000) {
+  if (b64.length < SMALL_FILE_B64_THRESHOLD) {
     await exec(sandbox, `echo '${b64}' | base64 -d > '${filePath}'`, "/");
     return;
   }
 
   // For large files, write base64 in chunks then decode
-  const chunkSize = 40000; // Safe chunk size for shell
+  const chunkSize = FILE_CHUNK_SIZE;
   const tempFile = `${filePath}.b64`;
   
   for (let i = 0; i < b64.length; i += chunkSize) {
@@ -581,7 +653,7 @@ async function syncCredentialsFromSandbox(sandbox: Sandbox, localCredentialsFile
   }
 }
 
-async function exec(
+export async function exec(
   sandbox: Sandbox,
   command: string,
   cwd: string,
@@ -622,6 +694,164 @@ async function exec(
   return { exitCode: await proc.wait(), stdout, stderr };
 }
 
+export async function startDetachedHarness(sandbox: Sandbox, cmd: string, cwd: string): Promise<void> {
+  await ensureLogDir(sandbox);
+  const preflight = await exec(
+    sandbox,
+    `mkdir -p '${activeLogDir}' && : > '${activeHarnessLogPath}' && echo "[Looper] Log stream initialized..." >> '${activeHarnessLogPath}'`,
+    "/"
+  );
+  if (preflight.exitCode !== 0) {
+    throw new Error(`Failed to prepare log file (exit code ${preflight.exitCode})`);
+  }
+  logInfo("Looper", `Log file ready at ${activeHarnessLogPath}`);
+
+  const script = `#!/usr/bin/env bash
+set -o pipefail
+cd '${cwd}'
+(
+  echo "[Looper] Harness process starting..."
+  ${cmd}
+) 2>&1 | tee -a '${activeHarnessLogPath}' /proc/1/fd/1
+echo \${PIPESTATUS[0]} > '${activeHarnessExitPath}'
+`;
+
+  await writeFileToSandbox(sandbox, activeHarnessRunnerPath, script);
+  logDebug("Looper", "Harness runner script uploaded");
+  const launchCmd = `chmod +x '${activeHarnessRunnerPath}' ; ` +
+    `rm -f '${activeHarnessExitPath}' '${activeHarnessPidPath}' ; ` +
+    `nohup '${activeHarnessRunnerPath}' </dev/null >/dev/null 2>&1 & ` +
+    `pid=$! ; ` +
+    `echo $pid > '${activeHarnessPidPath}' ; ` +
+    "exit 0";
+  const result = await exec(sandbox, launchCmd, "/");
+  if (result.exitCode !== 0) {
+    if (result.stdout) {
+      logWarn("Looper", `Harness launch stdout: ${result.stdout.trim()}`);
+    }
+    if (result.stderr) {
+      logWarn("Looper", `Harness launch stderr: ${result.stderr.trim()}`);
+    }
+    throw new Error(`Failed to start harness (exit code ${result.exitCode})`);
+  }
+  logInfo("Looper", "Harness runner launched");
+}
+
+async function startHarnessKeepalive(sandbox: Sandbox): Promise<void> {
+  const keepaliveCmd = [
+    "bash",
+    "-lc",
+    `while [ ! -s '${activeHarnessPidPath}' ]; do sleep 0.5; done; ` +
+      `pid=$(cat '${activeHarnessPidPath}'); ` +
+      `while kill -0 "$pid" 2>/dev/null; do sleep 30; done`,
+  ];
+  await sandbox.exec(keepaliveCmd);
+  logInfo("Looper", "Keepalive process started");
+}
+
+function setActiveLogDir(dir: string): void {
+  activeLogDir = dir;
+  activeHarnessLogPath = path.posix.join(dir, "harness.log");
+  activeHarnessExitPath = path.posix.join(dir, "harness.exit");
+  activeHarnessPidPath = path.posix.join(dir, "harness.pid");
+  activeHarnessRunnerPath = path.posix.join(dir, "run-harness.sh");
+}
+
+async function ensureLogDir(sandbox: Sandbox): Promise<void> {
+  const attempt = async (dir: string): Promise<boolean> => {
+    const testFile = path.posix.join(dir, ".looper-write-test");
+    const result = await exec(
+      sandbox,
+      `mkdir -p '${dir}' && : > '${testFile}' && rm -f '${testFile}'`,
+      "/"
+    );
+    return result.exitCode === 0;
+  };
+
+  if (await attempt(activeLogDir)) {
+    return;
+  }
+
+  if (activeLogDir === DEFAULT_LOG_DIR) {
+    const sudoResult = await exec(
+      sandbox,
+      `sudo mkdir -p '${DEFAULT_LOG_DIR}' && sudo chown -R looper:looper '${DEFAULT_LOG_DIR}'`,
+      "/"
+    );
+    if (sudoResult.exitCode === 0 && await attempt(DEFAULT_LOG_DIR)) {
+      return;
+    }
+  }
+
+  setActiveLogDir(FALLBACK_LOG_DIR);
+  if (!await attempt(activeLogDir)) {
+    throw new Error(`Failed to initialize log directory (${activeLogDir})`);
+  }
+  logWarn("Looper", `Log directory not writable, falling back to ${activeLogDir}`);
+}
+
+async function tryOpenLogFile(sandbox: Sandbox): Promise<SandboxFile | undefined> {
+  try {
+    return await sandbox.open(activeHarnessLogPath, "r");
+  } catch (err) {
+    logOpenFailures += 1;
+    if (logOpenFailures === 1 || logOpenFailures % 10 === 0) {
+      logWarn("Looper", `Failed to open log file at ${activeHarnessLogPath}`, err);
+    }
+    return undefined;
+  }
+}
+
+async function readExitCode(sandbox: Sandbox): Promise<number | undefined> {
+  try {
+    const exitFile = await sandbox.open(activeHarnessExitPath, "r");
+    const data = await exitFile.read();
+    await exitFile.close();
+    const text = Buffer.from(data).toString("utf8").trim();
+    if (!text) return 0;
+    const value = Number(text);
+    return Number.isFinite(value) ? value : 0;
+  } catch {
+    return undefined;
+  }
+}
+
+export async function streamHarnessLogs(sandbox: Sandbox): Promise<number> {
+  let exitCode: number | undefined;
+  let offset = 0;
+  let lastSize = 0;
+  logInfo("Looper", `Starting log stream from ${activeHarnessLogPath}`);
+
+  while (exitCode === undefined) {
+    try {
+      const logFile = await tryOpenLogFile(sandbox);
+      if (logFile) {
+        const data = await logFile.read();
+        await logFile.close();
+        const size = data.length;
+        if (size < lastSize) {
+          offset = 0;
+        }
+        if (size > offset) {
+          process.stdout.write(Buffer.from(data.slice(offset)));
+          offset = size;
+        }
+        lastSize = size;
+        logOpenFailures = 0;
+      }
+      exitCode = await readExitCode(sandbox);
+    } catch (err) {
+      logWarn("Looper", "Log stream interrupted; retrying...", err);
+    }
+
+    if (exitCode === undefined) {
+      await sleep(LOG_POLL_INTERVAL_MS);
+    }
+  }
+
+  return exitCode;
+}
+
 /** Mirror stdout/stderr into the sandbox's main PID so Modal UI shows the logs. */
 function mirrorOutputToSandboxLogs(command: string): string {
   // /proc/1/fd/{1,2} are the container's stdout/stderr streams that Modal captures.
@@ -642,7 +872,7 @@ async function ensureRepoExists(config: Config) {
   };
 
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 30000); // 30s timeout
+  const timeout = setTimeout(() => controller.abort(), GITHUB_API_TIMEOUT_MS);
 
   try {
     const check = await fetch(`https://api.github.com/repos/${owner}/${repo}`, {
@@ -724,8 +954,19 @@ async function scheduleRenewal(stopFilePath: string) {
       const secrets = Object.keys(secretEntries).length ? [await client.secrets.fromObject(secretEntries)] : [];
 
       const sandbox = await client.sandboxes.create(app, buildImage(client), {
-        cpu: 2.0, memoryMiB: 4096, timeoutMs: 24 * 60 * 60 * 1000,
-        volumes: { "/workspace": volume }, env, secrets,
+        cpu: DEFAULT_CPU_CORES,
+        memoryMiB: DEFAULT_MEMORY_MB,
+        timeoutMs: DEFAULT_TIMEOUT_MS,
+        idleTimeoutMs: (() => {
+          const idleTimeoutSecs = parseInt(process.env.LOOPER_IDLE_TIMEOUT_SECS ?? "", 10);
+          if (Number.isFinite(idleTimeoutSecs) && idleTimeoutSecs > 0) {
+            return idleTimeoutSecs * MS_PER_SECOND;
+          }
+          return DEFAULT_IDLE_TIMEOUT_MS;
+        })(),
+        volumes: { "/workspace": volume },
+        env,
+        secrets,
       });
 
       const startCmd = `cd /workspace/.looper && npm install --prefer-offline && sudo -E -u looper HOME=/home/looper npx tsx run.ts`;
@@ -745,6 +986,8 @@ async function runHarness() {
   const branch = process.env.REPOSITORY_BRANCH ?? "main";
   const baseBranch = process.env.REPOSITORY_BASE_BRANCH ?? branch;
   const model = process.env.MODEL ?? "sonnet";
+  const primaryAgent = (process.env.LOOPER_PRIMARY_AGENT as "claude" | "codex" | undefined) ?? "codex";
+  const enableReviewAgent = process.env.LOOPER_ENABLE_REVIEW === "1";
   const workingDir = process.env.WORKSPACE_DIR!;
   const maxSessions = parseInt(process.env.MAX_SESSIONS ?? "10", 10);
   const stopFilePath = process.env.LOOPER_STOP_FILE ?? path.join(workingDir, ".looper-stop-after-session");
@@ -754,47 +997,60 @@ async function runHarness() {
   const prompts = promptsJson ? JSON.parse(promptsJson) as LongRunningHarnessConfig["prompts"] : undefined;
   const continuous = process.env.LOOPER_CONTINUOUS === "1";
   const specAuditMaxAreasRaw = parseInt(process.env.LOOPER_SPEC_AUDIT_MAX_AREAS ?? "", 10);
-  const specAuditParallelismRaw = parseInt(process.env.LOOPER_SPEC_AUDIT_PARALLELISM ?? "", 10);
   const specAuditMaxAreas = Number.isFinite(specAuditMaxAreasRaw) ? specAuditMaxAreasRaw : undefined;
-  const specAuditParallelism = Number.isFinite(specAuditParallelismRaw) ? specAuditParallelismRaw : undefined;
 
   const projectSpec = await fs.readFile(specFile, "utf8");
 
-  const oauthCredentialsJson = process.env.CLAUDE_CODE_CREDENTIALS_JSON;
-  if (oauthCredentialsJson) {
-    const configDir = "/home/looper/.config/claude";
-    process.env.CLAUDE_CONFIG_DIR = configDir;
-    const credentialsPath = path.join(configDir, ".credentials.json");
-    await fs.mkdir(configDir, { recursive: true });
-    await fs.writeFile(credentialsPath, oauthCredentialsJson, "utf8");
-    delete process.env.ANTHROPIC_API_KEY;
-    logInfo("Harness", `Using Claude Code OAuth credentials from ${credentialsPath}`);
-  } else if (process.env.ANTHROPIC_API_KEY) {
-    logInfo("Harness", "Using ANTHROPIC_API_KEY for authentication");
-  } else {
-    logWarn("Harness", "Warning: No authentication credentials found (neither OAuth nor ANTHROPIC_API_KEY)");
+  const effectiveReviewAgent = reviewAgent ?? "codex";
+  if (primaryAgent === "codex" && effectiveReviewAgent === "claude") {
+    throw new Error("primaryAgent=codex cannot use reviewAgent=claude");
+  }
+  const reviewOrAuditEnabled = enableReviewAgent || Boolean(continuous);
+  const needsClaude = primaryAgent === "claude" || (reviewOrAuditEnabled && effectiveReviewAgent === "claude");
+  const needsCodex = primaryAgent === "codex" || (reviewOrAuditEnabled && effectiveReviewAgent === "codex");
+
+  if (needsClaude) {
+    const oauthCredentialsJson = process.env.CLAUDE_CODE_CREDENTIALS_JSON;
+    if (oauthCredentialsJson) {
+      const configDir = "/home/looper/.config/claude";
+      process.env.CLAUDE_CONFIG_DIR = configDir;
+      const credentialsPath = path.join(configDir, ".credentials.json");
+      await fs.mkdir(configDir, { recursive: true });
+      await fs.writeFile(credentialsPath, oauthCredentialsJson, "utf8");
+      delete process.env.ANTHROPIC_API_KEY;
+      logInfo("Harness", `Using Claude Code OAuth credentials from ${credentialsPath}`);
+    } else if (process.env.ANTHROPIC_API_KEY) {
+      logInfo("Harness", "Using ANTHROPIC_API_KEY for authentication");
+    } else {
+      logWarn("Harness", "Warning: No authentication credentials found (neither OAuth nor ANTHROPIC_API_KEY)");
+    }
   }
 
-  // Write Codex credentials if using codex review agent
-  const codexCredentialsJson = process.env.CODEX_CREDENTIALS_JSON;
-  if (codexCredentialsJson) {
-    const codexDir = "/home/looper/.codex";
-    const codexAuthPath = path.join(codexDir, "auth.json");
-    await fs.mkdir(codexDir, { recursive: true });
-    await fs.writeFile(codexAuthPath, codexCredentialsJson, { mode: 0o600 });
-    logInfo("Harness", `Using Codex credentials from ${codexAuthPath}`);
+  if (needsCodex) {
+    const codexCredentialsJson = process.env.CODEX_CREDENTIALS_JSON;
+    if (codexCredentialsJson) {
+      const codexDir = "/home/looper/.codex";
+      const codexAuthPath = path.join(codexDir, "auth.json");
+      await fs.mkdir(codexDir, { recursive: true });
+      await fs.writeFile(codexAuthPath, codexCredentialsJson, { mode: 0o600 });
+      logInfo("Harness", `Using Codex credentials from ${codexAuthPath}`);
+    } else {
+      logWarn("Harness", "Warning: Codex credentials not provided");
+    }
   }
 
   logInfo("Harness", `Project: ${projectName}`);
   logInfo("Harness", `Repo: ${repoUrl} (branch ${branch})`);
   logInfo("Harness", `Model: ${model}`);
+  logInfo("Harness", `Primary agent: ${primaryAgent}`);
+  logInfo("Harness", `Review enabled: ${enableReviewAgent ? "yes" : "no"}`);
   logInfo("Harness", `Sessions: ${maxSessions}`);
-  logInfo("Harness", `Review agent: ${reviewAgent ?? "codex"}${codexModel ? ` (model: ${codexModel})` : ""}`);
+  logInfo("Harness", `Review agent: ${effectiveReviewAgent}${codexModel ? ` (model: ${codexModel})` : ""}`);
   logInfo("Harness", `Continuous: ${continuous ? "yes" : "no"}`);
   if (continuous) {
     logInfo(
       "Harness",
-      `Spec audit: maxAreas=${specAuditMaxAreas ?? 10}, parallelism=${specAuditParallelism ?? 3}`
+      `Audit: maxAreas=${specAuditMaxAreas ?? 10}`
     );
   }
 
@@ -808,6 +1064,7 @@ async function runHarness() {
     projectSpec,
     projectName,
     model,
+    primaryAgent,
     repositoryUrl: repoUrl,
     branch,
     baseBranch,
@@ -815,15 +1072,14 @@ async function runHarness() {
     useProjectSettings: true,
     stopFilePath,
     // Review agent ping-pong flow
-    enableReviewAgent: true,
+    enableReviewAgent,
     maxReviewIterations: 5,
     maxReviewTurns: 100,
-    reviewAgent,
+    reviewAgent: effectiveReviewAgent,
     codexModel,
     prompts,
     continuous,
     specAuditMaxAreas,
-    specAuditParallelism,
     // Playwright MCP for browser automation during testing
     // Use the Chromium binary installed in the image (not Chrome, which requires sudo)
     mcpServers: {
@@ -881,12 +1137,15 @@ async function parseArgs(): Promise<Config> {
     projectName: "",
     instruction: "",
     sessions: 0, // 0 = unlimited sessions until tasks complete or stop file
-    cpu: 2.0,
-    memoryMb: 4096, // 4GB
+    cpu: DEFAULT_CPU_CORES,
+    memoryMb: DEFAULT_MEMORY_MB,
     timeoutSecs: 0, // 0 = no timeout
+    idleTimeoutSecs: 300,
     repoUrl: "",
     branch: "main",
     model: "opus",
+    primaryAgent: "codex",
+    enableReviewAgent: false,
     githubToken: process.env.GITHUB_TOKEN,
     anthropicApiKey: process.env.ANTHROPIC_API_KEY,
     continuous: false,
@@ -906,9 +1165,23 @@ async function parseArgs(): Promise<Config> {
       case "--cpu": config.cpu = parseFloat(args[++i]); break;
       case "--memory": config.memoryMb = parseInt(args[++i], 10); break;
       case "--timeout": config.timeoutSecs = parseInt(args[++i], 10); break;
+      case "--idle-timeout": config.idleTimeoutSecs = parseInt(args[++i], 10); break;
       case "--repo-url": config.repoUrl = args[++i]; break;
       case "--branch": config.branch = args[++i]; break;
       case "--model": config.model = args[++i]; break;
+      case "--primary-agent": {
+        const val = args[++i];
+        if (val === "claude" || val === "codex") {
+          config.primaryAgent = val;
+        } else {
+          console.error(`Error: --primary-agent must be 'claude' or 'codex', got '${val}'`);
+          process.exit(1);
+        }
+        break;
+      }
+      case "--enable-review":
+        config.enableReviewAgent = true;
+        break;
       case "--claude-oauth-file": config.claudeOAuthFile = args[++i]; break;
       case "--terminate": config.terminateExisting = true; break;
       case "--review-agent": {
@@ -924,7 +1197,6 @@ async function parseArgs(): Promise<Config> {
       case "--codex-model": config.codexModel = args[++i]; break;
       case "--continuous": config.continuous = true; break;
       case "--spec-audit-max-areas": config.specAuditMaxAreas = parseInt(args[++i], 10); break;
-      case "--spec-audit-parallelism": config.specAuditParallelism = parseInt(args[++i], 10); break;
       case "-h": case "--help": printUsage(); process.exit(0);
       default:
         if (!arg.startsWith("-") && !config.projectName) {
@@ -990,21 +1262,23 @@ Options:
   --cpu <cores>            CPU cores (default: 4.0)
   --memory <mb>            Memory MB (default: 16384)
   --timeout <secs>         Timeout seconds (default: none if 0)
-  --continuous             After tasks complete, run a Codex spec audit and continue if new tasks are added
+  --idle-timeout <secs>    Idle timeout seconds (default: 300)
+  --continuous             After tasks complete, run a Codex audit and continue if new tasks are added
   --spec-audit-max-areas <n> Max audit areas/reviewers (default: 10)
-  --spec-audit-parallelism <n> Max parallel Codex reviewers (default: 3)
   --repo-url <url>         GitHub repo URL
   --branch <branch>        Git branch (default: main)
   --model <model>          Claude model: opus, sonnet, etc. (default: opus)
+  --primary-agent <agent>  Primary agent: claude, codex (default: codex)
   --claude-oauth-file <f>  Path to Claude Code OAuth credentials JSON (default: ./.claude-code-credentials.json)
   --review-agent <agent>   Code review agent: claude, codex (default: codex)
   --codex-model <model>    Codex CLI model for review (default: codex's default)
+  --enable-review          Enable review agent ping-pong (default: off)
 
 Environment:
   GITHUB_OWNER             Derive repo URL from owner + project name
   GITHUB_TOKEN             Required for private repos
   ANTHROPIC_API_KEY        Required if OAuth credentials not provided
-  OPENAI_API_KEY           Required when using --review-agent codex
+  Codex auth               Loaded from ~/.codex/auth.json (run: codex auth login)
 
 Example:
   npx tsx run.ts cowsay --instruction "Build a CLI that prints ASCII cow"
