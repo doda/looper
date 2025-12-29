@@ -41,11 +41,11 @@ function hasScopeConflict(taskA: TaskSpec, taskB: TaskSpec): boolean {
 
 export function getReadyTasks(tasks: TaskSpec[], options: TaskScheduleOptions): TaskSpec[] {
   const deps = normalizeDependencies(tasks);
-  const passing = new Set(tasks.filter((t) => t.passes === true).map((t) => t.id));
+  const passing = new Set(tasks.filter((t) => t.completed === true).map((t) => t.id));
   const inProgressTasks = options.inProgressTasks ?? [];
 
   const ready = tasks.filter((task) => {
-    if (task.passes === true) return false;
+    if (task.completed === true) return false;
     if (options.inProgress.has(task.id)) return false;
 
     const taskDeps = deps.get(task.id) ?? [];

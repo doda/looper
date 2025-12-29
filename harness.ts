@@ -151,7 +151,7 @@ export interface LongRunningHarnessConfig {
   codexModel?: string;
 
   /**
-   * Enable continuous mode: run an audit when all tasks are passing.
+   * Enable continuous mode: run an audit when all tasks are complete.
    * The audit can add tasks, then the harness continues.
    */
   continuous?: boolean;
@@ -214,7 +214,7 @@ export interface TaskSpec {
   category: string;
   description: string;
   steps: string[];
-  passes?: boolean;
+  completed?: boolean;
   depends_on?: string[];
   scope?: string[];
 }
@@ -308,7 +308,7 @@ type CodexLogMode = "summary" | "full" | "quiet";
  * LongRunningHarness implements a two-agent harness on top of the Claude Agent SDK:
  *
  *  - Planning agent: first session only. Analyzes the project spec and creates:
- *      * task_list.json — COMPREHENSIVE list of ALL tasks from the spec with `passes` flags
+ *      * task_list.json — COMPREHENSIVE list of ALL tasks from the spec with `completed` flags
  *      * agent-progress.txt — log of requirements analysis + onboarding notes
  *      * init.sh — placeholder script (working agent will flesh this out)
  *      * CLAUDE.md — project context for future agents
@@ -320,7 +320,7 @@ type CodexLogMode = "summary" | "full" | "quiet";
  *      * Chooses a single failing task (starting with "project-setup" to scaffold)
  *      * Implements it end-to-end
  *      * Verifies it via tests / smoke checks
- *      * Marks the task as passing and commits + logs progress
+ *      * Marks the task as complete and commits + logs progress
  *
  * Each call to runWorkingSession() is an independent context window; the state
  * lives entirely in the repo (files + git history), following the pattern
@@ -687,8 +687,8 @@ export class LongRunningHarness {
         // Check if task already passing and committed - skip review
         const taskList = await this.readTaskList();
         const currentTask = taskList.find((t) => t.id === task.id);
-        if (currentTask?.passes === true) {
-          logInfo("Harness", `Task ${task.id} already marked passing - pushing`);
+        if (currentTask?.completed === true) {
+          logInfo("Harness", `Task ${task.id} already marked complete - pushing`);
           await this.pushIfNeeded("working", {
             taskId: task.id,
             result: "PASS",
@@ -712,8 +712,8 @@ export class LongRunningHarness {
           // Verify the reviewer actually updated task_list.json
           const taskList = await this.readTaskList();
           const updatedTask = taskList.find((t) => t.id === task.id);
-          if (!updatedTask?.passes) {
-            logWarn("Harness", `Review said PASS but task ${task.id} not marked as passing in task_list.json`);
+          if (!updatedTask?.completed) {
+            logWarn("Harness", `Review said PASS but task ${task.id} not marked as complete in task_list.json`);
             logWarn("Harness", "Treating as failed review - reviewer must update task_list.json");
             this.lastReviewIssues = ["Reviewer approved but did not update task_list.json"];
             continue; // Go to next iteration
@@ -875,8 +875,8 @@ export class LongRunningHarness {
 
         const taskList = await this.readTaskList();
         const currentTask = taskList.find((t) => t.id === task.id);
-        if (currentTask?.passes === true) {
-          logInfo("Harness", `Task ${task.id} already marked passing - pushing`);
+        if (currentTask?.completed === true) {
+          logInfo("Harness", `Task ${task.id} already marked complete - pushing`);
           await this.pushIfNeeded("working", {
             taskId: task.id,
             result: "PASS",
@@ -889,8 +889,8 @@ export class LongRunningHarness {
           this.lastReviewIssuesPath = null;
           const updatedTaskList = await this.readTaskList();
           const updatedTask = updatedTaskList.find((t) => t.id === task.id);
-          if (!updatedTask?.passes) {
-            logWarn("Harness", `Review said PASS but task ${task.id} not marked as passing in task_list.json`);
+          if (!updatedTask?.completed) {
+            logWarn("Harness", `Review said PASS but task ${task.id} not marked as complete in task_list.json`);
             logWarn("Harness", "Treating as failed review - reviewer must update task_list.json");
             this.lastReviewIssues = ["Reviewer approved but did not update task_list.json"];
             continue;
@@ -962,11 +962,11 @@ export class LongRunningHarness {
       const remaining = await this.countRemainingTasks();
       if (remaining === 0) {
         if (!this.cfg.continuous) {
-          logInfo("Harness", "All tasks are marked as passing. Nothing left to do.");
+          logInfo("Harness", "All tasks are marked as complete. Nothing left to do.");
           return;
         }
 
-        logInfo("Harness", "All tasks passing; starting audit...");
+        logInfo("Harness", "All tasks complete; starting audit...");
         const auditResult = await this.runSpecAudit();
         if (auditResult.addedTasks === 0) {
           logInfo("Harness", "Audit passed with no new tasks.");
@@ -1378,7 +1378,7 @@ export class LongRunningHarness {
   private normalizeNewTask(
     raw: TaskSpec | undefined,
     _keyOrder?: string[],
-    passesOverride?: boolean
+    completedOverride?: boolean
   ): TaskSpec | null {
     if (!raw || typeof raw !== "object") return null;
     const id = typeof raw.id === "string" ? this.normalizeTaskId(raw.id) : "";
@@ -1404,7 +1404,7 @@ export class LongRunningHarness {
       steps,
       ...(depends_on && depends_on.length > 0 ? { depends_on } : {}),
       ...(scope && scope.length > 0 ? { scope } : {}),
-      ...(typeof passesOverride === "boolean" ? { passes: passesOverride } : {}),
+      ...(typeof completedOverride === "boolean" ? { completed: completedOverride } : {}),
     };
 
     return task;
@@ -1737,7 +1737,7 @@ export class LongRunningHarness {
           return;
         }
 
-        if (eventType === "item.started" || eventType === "item.completed") {
+        if (eventType === "item.started" || eventType === "item.completedd") {
           const item = event?.item ?? {};
           const itemType = typeof item?.type === "string" ? item.type : "";
           if (itemType === "reasoning" && typeof item?.text === "string") {
@@ -2599,7 +2599,7 @@ ${this.buildCodexReviewOutputFormat(task.id, reviewNonce)}`;
 
   private buildCodexReviewOutputFormat(taskId: string, reviewNonce: string): string {
     const passActions = `If PASS, you MUST:
-1. Update task_list.json: set "passes": true for "${taskId}"
+1. Update task_list.json: set "completed": true for "${taskId}"
 2. Append to agent-progress.txt with a concise entry (aim for ~10 lines)
    noting what you reviewed, what you verified/tests run, any issues found, and how
    they were resolved (or note none).
@@ -3234,7 +3234,7 @@ This means the project has NOT been scaffolded yet. Your job is to:
    - If it fails, dedicate this session to fixing the environment first.
      * Inspect ".looper-init.log" (e.g. "tail -n 200 .looper-init.log").
      * Repair dependencies, scripts, or configuration until init.sh succeeds.
-     * Do NOT mark any tasks as passing while the environment is broken.
+     * Do NOT mark any tasks as complete while the environment is broken.
    - Once init.sh starts successfully, proceed with your task.
 `;
 
@@ -3248,7 +3248,7 @@ ${taskAssignment}${projectSetupSection}
 Key coordination artifacts (ALL at repo root):
 - CLAUDE.md — project context and guidelines (read this first).
 - SPEC.md — the FULL original project specification (reference for detailed requirements).
-- task_list.json — list of end-to-end tasks with a "passes" flag.
+- task_list.json — list of end-to-end tasks with a "completed" flag.
 - agent-progress.txt — log of previous work and instructions.
 - init.sh — script to start the environment and run smoke tests.
 - git log — history of previous changes.
@@ -3278,7 +3278,7 @@ Follow this checklist strictly:
    - Your task is already specified above. Do NOT pick a different task.
    - Review the task description and verification steps.
    - Work on THIS task only in this session.` : `Choose a task
-   - Find the highest-priority task whose "passes" flag is false.
+   - Find the highest-priority task whose "completed" flag is false.
    - Tasks are ordered by dependency—work from top to bottom.
    - Work on ONE task only in this session.`}
 ${verifyEnvironmentSection}
@@ -3312,7 +3312,7 @@ ${isProjectSetup ? "7" : "8"}) Update coordination artifacts ONLY when the task 
    - In task_list.json:
        - Set "passes": true for the completed task.
        - Do NOT edit "category", "description", or "steps" unless you are fixing an objectively incorrect test (e.g., the product requirements changed).
-       - It is unacceptable to delete or weaken tests just to make a task appear passing.
+       - It is unacceptable to delete or weaken tests just to make a task appear complete.
        - Do not remove or rename other tasks.
    - In agent-progress.txt:
        - Append a concise entry (aim for ~10 lines) noting:
@@ -3333,7 +3333,7 @@ ${isProjectSetup ? "7" : "8"}) Commit your work
    - Leave the working tree clean.
 
 Important constraints:
-- Never mark a task as passing without real end-to-end verification.
+- Never mark a task as complete without real end-to-end verification.
 - If the environment is badly broken, favor restoring a healthy baseline over
   adding new tasks.
 - If you finish early, invest remaining time in improving tests, docs,
@@ -3342,7 +3342,7 @@ Important constraints:
 - If you hit a blocker (library issues, missing APIs, unclear errors), create an
   investigation task and move on. Don't abandon libraries for hacky workarounds.
 - If you discover missing features/prerequisites: fix them now if feasible, otherwise
-  add them as new tasks in task_list.json with "passes": false and move on.
+  add them as new tasks in task_list.json with "completed": false and move on.
   Ensure new task ids do not collide with existing ones; pick a new id if needed.
 - Do NOT redefine task requirements to claim success:
     * "Identical failures" is NOT "identical behavior" - things must actually work
@@ -3446,7 +3446,7 @@ ${verifyEnvironmentSection}
 Implement the task end-to-end and verify using the task steps.
 
 Finish:
-- Update task_list.json to mark the task passing.
+- Update task_list.json to mark the task complete.
 - Update agent-progress.txt with a concise entry.
 - Commit with a focused message.
 
@@ -3462,7 +3462,7 @@ CRITICAL OVERRIDE - REVIEW MODE ACTIVE
 You are in REVIEW MODE. A separate review agent will audit your work.
 
 DO NOT:
-- Update task_list.json to set "passes": true
+- Update task_list.json to set "completed": true
 - Write to agent-progress.txt
 - Mark the task as complete in any way
 - Run "git commit" - leave your changes UNCOMMITTED
@@ -3525,7 +3525,7 @@ Rules:
 - If code doesn't work, fix it or mark the task as failing - don't rationalize
 
 If you discover missing prerequisites: fix them now if feasible, otherwise add them
-as new tasks with "passes": false and move on to something you can complete.
+as new tasks with "completed": false and move on to something you can complete.
 Ensure new task ids do not collide with existing ones; pick a new id if needed.
 
 After completing your work:
@@ -3571,7 +3571,7 @@ VERIFIED:
 - <what you verified>
 
 Then, if PASS, you MUST do ALL of the following in ONE ATOMIC COMMIT:
-1. Update task_list.json: set "passes": true for "${task.id}"
+1. Update task_list.json: set "completed": true for "${task.id}"
 2. Append to agent-progress.txt with a concise entry (aim for ~10 lines)
    noting what you reviewed, what you verified/tests run, any issues found, and how
    they were resolved (or note none).
@@ -3620,7 +3620,7 @@ VERIFIED:
 - <tests you ran and their output>
 
 If PASS, do ALL in ONE ATOMIC COMMIT:
-1. Update task_list.json: set "passes": true for "${task.id}"
+1. Update task_list.json: set "completed": true for "${task.id}"
 2. Append to agent-progress.txt with a concise entry (~10 lines)
 3. Stage ALL changes: git add -A
 4. Commit EVERYTHING with message:
@@ -3661,7 +3661,7 @@ VERIFIED:
 - <what you verified>
 
 If PASS, you MUST do ALL of the following in ONE ATOMIC COMMIT:
-1. Update task_list.json: set "passes": true for "${task.id}"
+1. Update task_list.json: set "completed": true for "${task.id}"
 2. Append to agent-progress.txt with a concise entry (aim for ~10 lines)
    noting what you reviewed, what you verified/tests run, any issues found, and how
    they were resolved (or note none).
@@ -3722,8 +3722,8 @@ If PASS, you MUST do ALL of the following in ONE ATOMIC COMMIT:
       }
 
       // Validate optional passes flag
-      if (record.passes !== undefined && typeof record.passes !== "boolean") {
-        throw new Error(`task_list.json entry ${idx} has an invalid "passes" flag (must be boolean)`);
+      if (record.completed !== undefined && typeof record.completed !== "boolean") {
+        throw new Error(`task_list.json entry ${idx} has an invalid "completed" flag (must be boolean)`);
       }
 
       if (record.depends_on !== undefined) {
@@ -3754,7 +3754,7 @@ If PASS, you MUST do ALL of the following in ONE ATOMIC COMMIT:
         category: record.category as string,
         description: record.description as string,
         steps: record.steps as string[],
-        ...(record.passes !== undefined ? { passes: record.passes as boolean } : {}),
+        ...(record.completed !== undefined ? { completed: record.completed as boolean } : {}),
         ...(record.depends_on !== undefined ? { depends_on: record.depends_on as string[] } : {}),
         ...(record.scope !== undefined ? { scope: record.scope as string[] } : {}),
       };
@@ -3802,7 +3802,7 @@ If PASS, you MUST do ALL of the following in ONE ATOMIC COMMIT:
       const data = await this.readTaskList();
       let remaining = 0;
       for (const item of data) {
-        if (item.passes === false || item.passes === undefined) {
+        if (item.completed === false || item.completed === undefined) {
           remaining += 1;
         }
       }
@@ -3829,7 +3829,7 @@ If PASS, you MUST do ALL of the following in ONE ATOMIC COMMIT:
     try {
       const data = await this.readTaskList();
       for (const item of data) {
-        if (item.passes === false || item.passes === undefined) {
+        if (item.completed === false || item.completed === undefined) {
           return item;
         }
       }

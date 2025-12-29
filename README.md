@@ -69,7 +69,7 @@ Looper uses a **two-agent architecture** running inside isolated [Modal](https:/
 
 | File | Purpose |
 |------|---------|
-| `task_list.json` | Tasks with `passes` flags, dependencies, and scopes |
+| `task_list.json` | Tasks with `completed` flags, dependencies, and scopes |
 | `agent-progress.txt` | Running log of work and decisions |
 | `init.sh` | Idempotent script to boot environment and run smoke tests |
 | `CLAUDE.md` | Project context and guidelines for agents |
@@ -100,7 +100,7 @@ The review agent defaults to Codex. Use `--review-agent claude` for Claude revie
 
 ## Continuous Mode (Spec Audit)
 
-Run indefinitely, auditing for new work when all tasks complete:
+Run indefinitely, auditing for new work when all tasks are completed:
 
 ```bash
 npx tsx run.ts my-project --instruction "Build X" --continuous
@@ -108,7 +108,7 @@ npx tsx run.ts my-project --instruction "Build X" --continuous
 
 **Flow:**
 1. Work through all failing tasks
-2. When all tasks pass, run spec audit
+2. When all tasks are completed, run spec audit
 3. Audit compares implementation against original spec
 4. If gaps found: add new tasks and continue
 5. Repeat until audit finds no issues
@@ -139,7 +139,7 @@ Options:
   --enable-review            Enable review agent ping-pong
   --review-agent <agent>     Review agent: claude, codex (default: codex)
   --codex-model <model>      Codex CLI model for work/review
-  --continuous               Run audit when tasks complete, add new work
+  --continuous               Run audit when tasks are completed, add new work
   --spec-audit-max-areas <n> Max audit areas (default: 10)
   --terminate                Terminate existing sandbox for this project
 ```

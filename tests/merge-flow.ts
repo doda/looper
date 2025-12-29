@@ -31,7 +31,7 @@ async function createRemoteRepo(task: TaskSpec): Promise<{ remoteDir: string; br
   const seedDir = await fs.mkdtemp(path.join(os.tmpdir(), "merge-flow-seed-"));
   await runGit(["init"], { cwd: seedDir });
 
-  const taskList = [{ ...task, passes: false }];
+  const taskList = [{ ...task, completed: false }];
   await writeFile(seedDir, "task_list.json", JSON.stringify(taskList, null, 2) + "\n");
   await writeFile(seedDir, "agent-progress.txt", "init\n");
   await writeFile(seedDir, "init.sh", "#!/usr/bin/env bash\ntrue\n");
@@ -98,7 +98,7 @@ async function main() {
     const taskListRaw = await fs.readFile(path.join(verifyDir, "task_list.json"), "utf8");
     const taskList = JSON.parse(taskListRaw) as TaskSpec[];
     const entry = taskList.find((item) => item.id === task.id);
-    assert(entry?.passes === true, "Task not marked as passing in task_list.json.");
+    assert(entry?.completed === true, "Task not marked as complete in task_list.json.");
 
     await runGit(["fetch", "origin", `+${taskBranch}:refs/remotes/origin/${taskBranch}`], { cwd: verifyDir });
     const mainSha = (await runGit(["rev-parse", `origin/${remote.branch}`], { cwd: verifyDir })).stdout.toString().trim();

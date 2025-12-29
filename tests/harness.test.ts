@@ -115,7 +115,7 @@ describe("LongRunningHarness", () => {
 
   it("skips the planning agent when all artifacts are present and valid", async () => {
     const taskList = [
-      { id: "f1", category: "functional", description: "a", steps: ["step"], passes: false },
+      { id: "f1", category: "functional", description: "a", steps: ["step"], completed: false },
     ];
     const { remote, branch } = await createRemoteWithFiles({
       "task_list.json": JSON.stringify(taskList, null, 2),
@@ -184,8 +184,8 @@ describe("LongRunningHarness", () => {
 
   it("counts remaining tasks correctly", async () => {
     const taskList = [
-      { id: "f1", category: "functional", description: "a", steps: ["step"], passes: false },
-      { id: "f2", category: "functional", description: "b", steps: ["step"], passes: true },
+      { id: "f1", category: "functional", description: "a", steps: ["step"], completed: false },
+      { id: "f2", category: "functional", description: "b", steps: ["step"], completed: true },
       { id: "f3", category: "functional", description: "c", steps: ["step"] },
     ];
     const { remote, branch } = await createRemoteWithFiles({

@@ -14,7 +14,7 @@
  *   --memory <mb>          Memory in MB (default: 16384)
  *   --timeout <secs>       Timeout in seconds (default: 3600)
  *   --idle-timeout <secs>  Idle timeout in seconds (default: 300)
- *   --continuous           After tasks complete, run a Codex audit and continue if new tasks are added
+ *   --continuous           After tasks are completed, run a Codex audit and continue if new tasks are added
  *   --spec-audit-max-areas <n> Max audit areas/reviewers (default: 10)
  *   --model <model>        Claude model: opus, sonnet (default: opus)
  *   --primary-agent <a>   Primary agent for planning/working: claude, codex (default: codex)
@@ -1136,7 +1136,7 @@ async function parseArgs(): Promise<Config> {
   const config: Config = {
     projectName: "",
     instruction: "",
-    sessions: 0, // 0 = unlimited sessions until tasks complete or stop file
+    sessions: 0, // 0 = unlimited sessions until tasks are completed or stop file
     cpu: DEFAULT_CPU_CORES,
     memoryMb: DEFAULT_MEMORY_MB,
     timeoutSecs: 0, // 0 = no timeout
@@ -1263,7 +1263,7 @@ Options:
   --memory <mb>            Memory MB (default: 16384)
   --timeout <secs>         Timeout seconds (default: none if 0)
   --idle-timeout <secs>    Idle timeout seconds (default: 300)
-  --continuous             After tasks complete, run a Codex audit and continue if new tasks are added
+  --continuous             After tasks are completed, run a Codex audit and continue if new tasks are added
   --spec-audit-max-areas <n> Max audit areas/reviewers (default: 10)
   --repo-url <url>         GitHub repo URL
   --branch <branch>        Git branch (default: main)
