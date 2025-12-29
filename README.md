@@ -70,16 +70,16 @@ The `claude_code` preset provides:
 - Security and safety instructions
 - Environment context
 
-### 2. CLAUDE.md Files (Persistent Context)
+### 2. CLAUDE.md (Persistent Context)
 
-Looper reads `CLAUDE.md` from both:
-- **Looper repo** — Shared harness philosophy and guidelines
-- **Target project** — Project-specific architecture, standards, and commands
+The Claude SDK reads `CLAUDE.md` from the **target project** directory, providing project-specific architecture, standards, and commands to agents.
 
 This is enabled via:
 ```typescript
 settingSources: ["project"]
 ```
+
+The planning agent creates this file during initialization.
 
 ### 3. System Prompt Append (Phase-Specific)
 
