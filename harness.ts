@@ -2623,6 +2623,11 @@ Return EXACTLY one block with valid JSON between the markers. Do not include any
 This output format overrides any earlier instructions about response formatting.
 Use "PASS" only if all instructions above are completed and any required verification succeeded.
 
+IMPORTANT - If you are about to report FAIL:
+1. Append to agent-progress.txt explaining what you tried, why it failed, and any insights for the next attempt
+2. Stage and commit: git add agent-progress.txt && git commit -m "Document failed attempt: <brief reason>"
+3. Then output the FAIL result below
+
 <<<${marker}:${nonce}>>>
 {"result":"<PASS|FAIL>","notes":["<short notes>"],"tests":["<tests you ran>"]}
 <<<END_${marker}:${nonce}>>>`;
@@ -2837,14 +2842,16 @@ Use "PASS" only if all instructions above are completed and any required verific
 
     const env = this.buildGitEnv();
 
+    // Always append failure note to agent-progress.txt (even if no code changes)
+    if (context?.result && context.result !== "PASS") {
+      await this.appendAutoCommitNote(phase, context);
+    }
+
     // Check for uncommitted changes and auto-commit if needed
     try {
       const status = await execFileAsync("git", ["-C", this.workingDir, "status", "--porcelain"], { env });
       const uncommitted = status.stdout.trim();
       if (uncommitted) {
-        if (context?.result && context.result !== "PASS") {
-          await this.appendAutoCommitNote(phase, context);
-        }
         logWarn("Harness", "Found uncommitted changes, auto-committing...");
         await this.ensureGitIdentity(env);
         await execFileAsync("git", ["-C", this.workingDir, "add", "-A"], { env });
