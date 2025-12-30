@@ -1196,7 +1196,7 @@ export class LongRunningHarness {
   }
 
   private getSpecAuditLenses(): string[] {
-    return ["integration-testing", "correctness", "safety", "maintainability"];
+    return ["spec", "integration-testing", "correctness", "safety", "maintainability"];
   }
 
   private async getNextSpecAuditLens(): Promise<string> {
@@ -1896,7 +1896,7 @@ Your job: decide how many reviewers (1-${maxAreas}) are needed and define
 non-overlapping functional areas to audit. Use fewer areas for small codebases.
 If you need more context, inspect the repo (git ls-files, rg, ls).
 This audit's lens is "${auditLens}". Use ONLY this lens for every area.
-Lens options: integration-testing, correctness, safety, maintainability.
+Lens options: spec, integration-testing, correctness, safety, maintainability.
 
 OUTPUT FORMAT (MACHINE READABLE ONLY):
 Return EXACTLY one block with valid JSON between the markers. Do not include any other text.
@@ -1908,7 +1908,7 @@ Schema:
       "id": "kebab-case-id",
       "title": "Area name",
       "focus": "What to review in this area",
-      "lens": "integration-testing|correctness|safety|maintainability",
+      "lens": "spec|integration-testing|correctness|safety|maintainability",
       "paths": ["optional/path", "optional/glob"],
       "rationale": "why this area matters"
     }
@@ -1943,8 +1943,9 @@ Lens: ${area.lens ?? "spec"}
 Relevant paths: ${paths || "(none specified)"}
 
 Audit this area using the lens above. Lens guide:
+- spec: does code match the spec? missing features, deviations from requirements, incomplete implementations
 - integration-testing: cross-component flows, realistic scenarios, missing integration tests
-- correctness: spec adherence, bugs, edge cases, test coverage gaps
+- correctness: bugs, edge cases, test coverage gaps
 - safety: security + reliability (input validation, auth, data exposure, failure handling)
 - maintainability: refactor needs, docs/observability debt, unclear boundaries, perf smells
 If the lens doesn't apply, say so in notes and still report clear issues you find.
@@ -2070,7 +2071,7 @@ ${this.cfg.projectSpec.trim()}
 
 Your job:
 - Verify the repo matches the spec, but focus this audit on a single lens.
-- Lens options: integration-testing, correctness, safety, maintainability.
+- Lens options: spec, integration-testing, correctness, safety, maintainability.
 - This audit lens is "${auditLens}". Apply it thoroughly; do not try to cover all lenses.
 - Run relevant checks (init.sh, tests) when available.
 - If gaps exist, add new tasks to task_list.json.
