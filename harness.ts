@@ -3154,14 +3154,14 @@ In this session you must:
            "Verify the chosen framework/stack is installed",
            "Confirm the project structure matches best practices for the stack"
          ],
-         "passes": false
+         "completed": false
        }
   - For EVERY other requirement in the spec, create a task object with:
       - "id": short, stable identifier (kebab-case)
       - "category": e.g. "functional", "ui", "api", "infrastructure", "performance", "security"
       - "description": one-sentence behavior description
       - "steps": ordered list of manual test steps a human can follow to verify it works
-      - "passes": false (always false initially)
+      - "completed": false (always false initially)
       - "depends_on": optional list of prerequisite task ids (be explicit when tasks can run in parallel)
       - "scope": optional list of paths or areas this task is likely to touch (for conflict avoidance)
    - Be EXHAUSTIVE. Every task, behavior, and capability in the spec must have
@@ -3210,7 +3210,7 @@ CRITICAL RULES:
 - Do NOT choose specific dependencies or create package.json/requirements.txt etc.
 - Do NOT implement any tasks. Your ONLY job is planning and documentation.
 - Focus 90% of your effort on creating a COMPLETE task list.
-- All "passes" flags MUST be false.
+- All "completed" flags MUST be false.
 - If you're unsure whether something is a task, include it. More is better.
 - If existing artifacts are present, integrate them but ensure the task list
   covers the ENTIRE spec, not just what was previously identified.
@@ -3343,7 +3343,7 @@ ${this.cfg.prompts.completionCriteria}
 
 ${isProjectSetup ? "7" : "8"}) Update coordination artifacts ONLY when the task truly works` : `${isProjectSetup ? "6" : "7"}) Update coordination artifacts ONLY when the task truly works`}
    - In task_list.json:
-       - Set "passes": true for the completed task.
+       - Set "completed": true for the completed task.
        - Do NOT edit "category", "description", or "steps" unless you are fixing an objectively incorrect test (e.g., the product requirements changed).
        - It is unacceptable to delete or weaken tests just to make a task appear complete.
        - Do not remove or rename other tasks.
@@ -3754,7 +3754,7 @@ If PASS, you MUST do ALL of the following in ONE ATOMIC COMMIT:
         }
       }
 
-      // Validate optional passes flag
+      // Validate optional completed flag
       if (record.completed !== undefined && typeof record.completed !== "boolean") {
         throw new Error(`task_list.json entry ${idx} has an invalid "completed" flag (must be boolean)`);
       }

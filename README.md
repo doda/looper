@@ -154,7 +154,7 @@ Tasks in `task_list.json` support dependencies and scope-based conflict detectio
   "category": "backend",
   "description": "Implement user authentication",
   "steps": ["Create auth middleware", "Add login endpoint"],
-  "passes": false,
+  "completed": false,
   "depends_on": ["project-setup"],
   "scope": ["src/auth/", "src/middleware/"]
 }

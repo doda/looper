@@ -139,7 +139,7 @@ describe("LongRunningHarness", () => {
   it("clones from a remote repository when provided", async () => {
     const { remote, branch } = await createRemoteWithFiles({
       "task_list.json": JSON.stringify(
-        [{ id: "f1", category: "functional", description: "a", steps: ["step"], passes: false }],
+        [{ id: "f1", category: "functional", description: "a", steps: ["step"], completed: false }],
         null,
         2
       ),
