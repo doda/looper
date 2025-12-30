@@ -409,17 +409,18 @@ async function runInModal() {
     sigintCount += 1;
 
     if (sigintCount === 1) {
-      logInfo("Looper", "\nCtrl+C received. Will stop after the current session finishes. Press Ctrl+C again to force terminate.");
+      // Use console.log for synchronous output (pino-pretty is async)
+      console.log("\n[Looper] Ctrl+C received. Will stop after the current session finishes. Press Ctrl+C again to force terminate.");
       void requestGracefulStop(sandbox);
       return;
     }
 
     if (sigintCount >= 3) {
-      logInfo("Looper", "\nForce exit.");
+      console.log("\n[Looper] Force exit.");
       process.exit(1);
     }
 
-    logInfo("Looper", "\nForcing shutdown and terminating sandbox...");
+    console.log("\n[Looper] Forcing shutdown and terminating sandbox...");
     sandboxTerminated = true;
     terminateAllSandboxes().then(() => sandbox.terminate()).then(() => {
       process.exit(1);
@@ -1096,19 +1097,18 @@ async function runHarness() {
   });
 
   let sigintCount = 0;
-  const handleSigint = async () => {
+  const handleSigint = () => {
     sigintCount += 1;
     if (sigintCount === 1) {
-      logInfo("Harness", "\nCtrl+C received. Will stop after the current session finishes. Press Ctrl+C again to exit immediately.");
-      try {
-        await fs.writeFile(stopFilePath, "stop", "utf8");
-      } catch (err) {
-        logWarn("Harness", "Failed to write stop file", err);
-      }
+      // Use console.log for synchronous output (pino-pretty is async)
+      console.log("\n[Harness] Ctrl+C received. Will stop after the current session finishes. Press Ctrl+C again to exit immediately.");
+      fs.writeFile(stopFilePath, "stop", "utf8").catch((err) => {
+        console.error("[Harness] Failed to write stop file:", err);
+      });
       return;
     }
 
-    logInfo("Harness", "\nExiting immediately due to repeated Ctrl+C.");
+    console.log("\n[Harness] Exiting immediately due to repeated Ctrl+C.");
     process.exit(1);
   };
 
