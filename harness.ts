@@ -1646,6 +1646,23 @@ export class LongRunningHarness {
         }
       };
 
+      const extractAgentText = (message: any): string | null => {
+        if (typeof message === "string") return message;
+        if (!message) return null;
+        if (typeof message.text === "string") return message.text;
+        const content = Array.isArray(message)
+          ? message
+          : Array.isArray(message.content)
+            ? message.content
+            : null;
+        if (!content) return null;
+        const parts = content
+          .map((block) => (block?.type === "text" && typeof block.text === "string" ? block.text : null))
+          .filter((text): text is string => Boolean(text));
+        if (parts.length === 0) return null;
+        return parts.join("\n");
+      };
+
       const handleMessage = (msg: any): void => {
         switch (msg?.type) {
           case "task_started":
@@ -1681,23 +1698,25 @@ export class LongRunningHarness {
             }
             break;
           }
-          case "agent_message": {
-            if (typeof msg.message === "string") {
-              agentMessages.push(msg.message);
-              lastAgentMessage = msg.message;
-              if (mode === "full") {
-                const stripped = msg.message.replace(/<<<CODEX_[\s\S]*?<<<END_CODEX_[^>]*>>>/g, "").trim();
-                if (stripped) {
-                  for (const line of stripped.split("\n")) {
-                    logLine(line);
-                  }
+          case "agent_message":
+          case "assistant_message":
+          case "assistant": {
+            const text = extractAgentText(msg.message ?? msg);
+            if (!text) break;
+            agentMessages.push(text);
+            lastAgentMessage = text;
+            if (mode === "full") {
+              const stripped = text.replace(/<<<CODEX_[\s\S]*?<<<END_CODEX_[^>]*>>>/g, "").trim();
+              if (stripped) {
+                for (const line of stripped.split("\n")) {
+                  logLine(line);
                 }
-              } else if (mode === "summary") {
-                const stripped = msg.message.replace(/<<<CODEX_[\s\S]*?<<<END_CODEX_[^>]*>>>/g, "").trim();
-                if (stripped) {
-                  const firstLine = stripped.split("\n")[0];
-                  if (firstLine) logLine(firstLine.slice(0, 200));
-                }
+              }
+            } else if (mode === "summary") {
+              const stripped = text.replace(/<<<CODEX_[\s\S]*?<<<END_CODEX_[^>]*>>>/g, "").trim();
+              if (stripped) {
+                const firstLine = stripped.split("\n")[0];
+                if (firstLine) logLine(firstLine.slice(0, 200));
               }
             }
             break;
@@ -1737,7 +1756,7 @@ export class LongRunningHarness {
           return;
         }
 
-        if (eventType === "item.started" || eventType === "item.completedd") {
+        if (eventType === "item.started" || eventType === "item.completed") {
           const item = event?.item ?? {};
           const itemType = typeof item?.type === "string" ? item.type : "";
           if (itemType === "reasoning" && typeof item?.text === "string") {
