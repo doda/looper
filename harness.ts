@@ -2842,21 +2842,28 @@ IMPORTANT - If you are about to report FAIL:
 
     const env = this.buildGitEnv();
 
-    // Always append failure note to agent-progress.txt (even if no code changes)
-    if (context?.result && context.result !== "PASS") {
-      await this.appendAutoCommitNote(phase, context);
-    }
-
     // Check for uncommitted changes and auto-commit if needed
     try {
       const status = await execFileAsync("git", ["-C", this.workingDir, "status", "--porcelain"], { env });
       const uncommitted = status.stdout.trim();
-      if (uncommitted) {
-        logWarn("Harness", "Found uncommitted changes, auto-committing...");
-        await this.ensureGitIdentity(env);
-        await execFileAsync("git", ["-C", this.workingDir, "add", "-A"], { env });
-        await execFileAsync("git", ["-C", this.workingDir, "commit", "-m", `Auto-commit uncommitted changes (${phase})`], { env });
-        logInfo("Harness", `Auto-committed uncommitted changes`);
+
+      // Append failure note to agent-progress.txt:
+      // - For explicit FAIL: always write (even if agent reverted all changes)
+      // - For ERROR (infra issues): only write if there are uncommitted changes
+      if (context?.result === "FAIL" || (uncommitted && context?.result && context.result !== "PASS")) {
+        await this.appendAutoCommitNote(phase, context);
+      }
+
+      if (uncommitted || context?.result === "FAIL") {
+        // Re-check status after possibly appending note
+        const newStatus = await execFileAsync("git", ["-C", this.workingDir, "status", "--porcelain"], { env });
+        if (newStatus.stdout.trim()) {
+          logWarn("Harness", "Found uncommitted changes, auto-committing...");
+          await this.ensureGitIdentity(env);
+          await execFileAsync("git", ["-C", this.workingDir, "add", "-A"], { env });
+          await execFileAsync("git", ["-C", this.workingDir, "commit", "-m", `Auto-commit uncommitted changes (${phase})`], { env });
+          logInfo("Harness", `Auto-committed uncommitted changes`);
+        }
       }
     } catch (err) {
       logWarn("Harness", "Failed to check/commit uncommitted changes", err);
