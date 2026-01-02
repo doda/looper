@@ -29,7 +29,7 @@
  */
 
 import "dotenv/config";
-import { ModalClient, type Sandbox, type SandboxFile } from "modal";
+import { ModalClient, type Sandbox } from "modal";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { execFile } from "node:child_process";
@@ -80,6 +80,8 @@ const DEFAULT_IDLE_TIMEOUT_MS = 60 * MS_PER_SECOND;
 const FORCE_EXIT_TIMEOUT_MS = 3 * MS_PER_SECOND;
 const GITHUB_API_TIMEOUT_MS = 30 * MS_PER_SECOND;
 const LOG_POLL_INTERVAL_MS = 2 * MS_PER_SECOND;
+const LOG_STREAM_IDLE_TIMEOUT_MS = 60 * MS_PER_SECOND;
+const LOG_STREAM_WATCHDOG_INTERVAL_MS = 5 * MS_PER_SECOND;
 const RENEWAL_AFTER_MS = 23 * MS_PER_HOUR;
 
 // File transfer limits
@@ -104,6 +106,7 @@ let activeHarnessLogPath = path.posix.join(activeLogDir, "harness.log");
 let activeHarnessExitPath = path.posix.join(activeLogDir, "harness.exit");
 let activeHarnessPidPath = path.posix.join(activeLogDir, "harness.pid");
 let activeHarnessRunnerPath = path.posix.join(activeLogDir, "run-harness.sh");
+let activeHarnessTailPidPath = path.posix.join(activeLogDir, "harness.tail.pid");
 
 async function main() {
   if (IN_MODAL) {
@@ -755,6 +758,7 @@ function setActiveLogDir(dir: string): void {
   activeHarnessExitPath = path.posix.join(dir, "harness.exit");
   activeHarnessPidPath = path.posix.join(dir, "harness.pid");
   activeHarnessRunnerPath = path.posix.join(dir, "run-harness.sh");
+  activeHarnessTailPidPath = path.posix.join(dir, "harness.tail.pid");
 }
 
 async function ensureLogDir(sandbox: Sandbox): Promise<void> {
@@ -820,6 +824,18 @@ async function getLogSize(sandbox: Sandbox): Promise<number | undefined> {
   }
 }
 
+async function killTailStream(sandbox: Sandbox): Promise<void> {
+  try {
+    await exec(
+      sandbox,
+      `if [ -f '${activeHarnessTailPidPath}' ]; then kill $(cat '${activeHarnessTailPidPath}') >/dev/null 2>&1 || true; rm -f '${activeHarnessTailPidPath}'; fi`,
+      "/"
+    );
+  } catch {
+    // Ignore errors when best-effort terminating a stalled stream.
+  }
+}
+
 export async function streamHarnessLogs(sandbox: Sandbox): Promise<number> {
   let exitCode: number | undefined;
   let offset = 0;
@@ -833,45 +849,82 @@ export async function streamHarnessLogs(sandbox: Sandbox): Promise<number> {
       }
 
       const tailCmd = [
+        `rm -f '${activeHarnessTailPidPath}'`,
+        `echo $$ > '${activeHarnessTailPidPath}'`,
         `while [ ! -f '${activeHarnessLogPath}' ]; do sleep 0.5; done;`,
-        `tail -c +$(( ${offset} + 1 )) -F '${activeHarnessLogPath}' &`,
-        "tail_pid=$!;",
-        `while [ ! -f '${activeHarnessExitPath}' ]; do sleep 0.5; done;`,
-        "kill $tail_pid >/dev/null 2>&1 || true;",
-        "wait $tail_pid >/dev/null 2>&1 || true;",
-      ].join(" ");
+        `tail -c +$(( ${offset} + 1 )) -F '${activeHarnessLogPath}'`,
+      ].join(" && ");
       const proc = await sandbox.exec(["bash", "-lc", tailCmd]);
 
       const bytes = { n: 0 };
       let stderrText = "";
+      let lastByteAt = Date.now();
+
+      const stdoutReader = proc.stdout.getReader();
+      const stderrReader = proc.stderr.getReader();
+      const watchdogState = { stopped: false };
 
       const drainOut = async () => {
-        for await (const chunk of proc.stdout) {
-          if (typeof chunk === "string") {
-            process.stdout.write(chunk);
-            bytes.n += Buffer.byteLength(chunk);
-          } else {
-            const buf = Buffer.from(chunk);
+        while (true) {
+          const { value, done } = await stdoutReader.read();
+          if (done) break;
+          if (typeof value === "string") {
+            process.stdout.write(value);
+            bytes.n += Buffer.byteLength(value);
+          } else if (value) {
+            const buf = Buffer.from(value);
             process.stdout.write(buf);
             bytes.n += buf.length;
           }
+          lastByteAt = Date.now();
         }
       };
       const drainErr = async () => {
-        for await (const chunk of proc.stderr) {
-          const text = typeof chunk === "string" ? chunk : new TextDecoder().decode(chunk);
-          stderrText += text;
+        while (true) {
+          const { value, done } = await stderrReader.read();
+          if (done) break;
+          if (value) {
+            const text = typeof value === "string" ? value : new TextDecoder().decode(value);
+            stderrText += text;
+          }
         }
       };
 
-      await Promise.all([drainOut(), drainErr(), proc.wait()]);
+      const watchdog = async () => {
+        while (true) {
+          if (watchdogState.stopped) return "stopped";
+          await sleep(LOG_STREAM_WATCHDOG_INTERVAL_MS);
+          exitCode = await readExitCode(sandbox);
+          if (exitCode !== undefined) return "exit";
+          const latestSize = await getLogSize(sandbox);
+          const idleMs = Date.now() - lastByteAt;
+          if (latestSize !== undefined && latestSize > offset && idleMs > LOG_STREAM_IDLE_TIMEOUT_MS) {
+            return "idle";
+          }
+        }
+      };
+
+      const outPromise = drainOut();
+      const errPromise = drainErr();
+      const watchdogPromise = watchdog();
+      const result = await Promise.race([outPromise.then(() => "done"), watchdogPromise]);
+      watchdogState.stopped = true;
+      await stdoutReader.cancel().catch(() => {});
+      await stderrReader.cancel().catch(() => {});
+      await killTailStream(sandbox);
+      await Promise.allSettled([outPromise, errPromise, watchdogPromise]);
+
+      if (result === "done" && exitCode === undefined) {
+        exitCode = await readExitCode(sandbox);
+      }
       offset += bytes.n;
 
       if (stderrText.trim()) {
         logWarn("Looper", `Log tail stderr: ${stderrText.trim()}`);
       }
-
-      exitCode = await readExitCode(sandbox);
+      if (result === "idle" && exitCode === undefined) {
+        logWarn("Looper", "Log stream idle while log grew; reconnecting...");
+      }
     } catch (err) {
       logWarn("Looper", "Log stream interrupted; retrying...", err);
     }
