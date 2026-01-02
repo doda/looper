@@ -848,12 +848,11 @@ export async function streamHarnessLogs(sandbox: Sandbox): Promise<number> {
         offset = 0;
       }
 
-      const tailCmd = [
-        `rm -f '${activeHarnessTailPidPath}'`,
-        `echo $$ > '${activeHarnessTailPidPath}'`,
-        `while [ ! -f '${activeHarnessLogPath}' ]; do sleep 0.5; done;`,
-        `tail -c +$(( ${offset} + 1 )) -F '${activeHarnessLogPath}'`,
-      ].join(" && ");
+      const tailCmd =
+        `rm -f '${activeHarnessTailPidPath}' && ` +
+        `echo $$ > '${activeHarnessTailPidPath}' && ` +
+        `while [ ! -f '${activeHarnessLogPath}' ]; do sleep 0.5; done; ` +
+        `tail -c +$(( ${offset} + 1 )) -F '${activeHarnessLogPath}'`;
       const proc = await sandbox.exec(["bash", "-lc", tailCmd]);
 
       const bytes = { n: 0 };
