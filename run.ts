@@ -104,7 +104,6 @@ let activeHarnessLogPath = path.posix.join(activeLogDir, "harness.log");
 let activeHarnessExitPath = path.posix.join(activeLogDir, "harness.exit");
 let activeHarnessPidPath = path.posix.join(activeLogDir, "harness.pid");
 let activeHarnessRunnerPath = path.posix.join(activeLogDir, "run-harness.sh");
-let logOpenFailures = 0;
 
 async function main() {
   if (IN_MODAL) {
@@ -791,18 +790,6 @@ async function ensureLogDir(sandbox: Sandbox): Promise<void> {
   logWarn("Looper", `Log directory not writable, falling back to ${activeLogDir}`);
 }
 
-async function tryOpenLogFile(sandbox: Sandbox): Promise<SandboxFile | undefined> {
-  try {
-    return await sandbox.open(activeHarnessLogPath, "r");
-  } catch (err) {
-    logOpenFailures += 1;
-    if (logOpenFailures === 1 || logOpenFailures % 10 === 0) {
-      logWarn("Looper", `Failed to open log file at ${activeHarnessLogPath}`, err);
-    }
-    return undefined;
-  }
-}
-
 async function readExitCode(sandbox: Sandbox): Promise<number | undefined> {
   try {
     const exitFile = await sandbox.open(activeHarnessExitPath, "r");
@@ -879,7 +866,6 @@ export async function streamHarnessLogs(sandbox: Sandbox): Promise<number> {
 
       await Promise.all([drainOut(), drainErr(), proc.wait()]);
       offset += bytes.n;
-      logOpenFailures = 0;
 
       if (stderrText.trim()) {
         logWarn("Looper", `Log tail stderr: ${stderrText.trim()}`);
