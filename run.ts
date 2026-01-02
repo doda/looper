@@ -817,29 +817,74 @@ async function readExitCode(sandbox: Sandbox): Promise<number | undefined> {
   }
 }
 
+async function getLogSize(sandbox: Sandbox): Promise<number | undefined> {
+  try {
+    const result = await exec(
+      sandbox,
+      `if [ -f '${activeHarnessLogPath}' ]; then wc -c < '${activeHarnessLogPath}'; else echo 0; fi`,
+      "/"
+    );
+    if (result.exitCode !== 0) return undefined;
+    const raw = result.stdout.trim().split(/\s+/)[0];
+    const size = Number(raw);
+    return Number.isFinite(size) ? size : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 export async function streamHarnessLogs(sandbox: Sandbox): Promise<number> {
   let exitCode: number | undefined;
   let offset = 0;
-  let lastSize = 0;
   logInfo("Looper", `Starting log stream from ${activeHarnessLogPath}`);
 
   while (exitCode === undefined) {
     try {
-      const logFile = await tryOpenLogFile(sandbox);
-      if (logFile) {
-        const data = await logFile.read();
-        await logFile.close();
-        const size = data.length;
-        if (size < lastSize) {
-          offset = 0;
-        }
-        if (size > offset) {
-          process.stdout.write(Buffer.from(data.slice(offset)));
-          offset = size;
-        }
-        lastSize = size;
-        logOpenFailures = 0;
+      const size = await getLogSize(sandbox);
+      if (size !== undefined && size < offset) {
+        offset = 0;
       }
+
+      const tailCmd = [
+        `while [ ! -f '${activeHarnessLogPath}' ]; do sleep 0.5; done;`,
+        `tail -c +$(( ${offset} + 1 )) -F '${activeHarnessLogPath}' &`,
+        "tail_pid=$!;",
+        `while [ ! -f '${activeHarnessExitPath}' ]; do sleep 0.5; done;`,
+        "kill $tail_pid >/dev/null 2>&1 || true;",
+        "wait $tail_pid >/dev/null 2>&1 || true;",
+      ].join(" ");
+      const proc = await sandbox.exec(["bash", "-lc", tailCmd]);
+
+      const bytes = { n: 0 };
+      let stderrText = "";
+
+      const drainOut = async () => {
+        for await (const chunk of proc.stdout) {
+          if (typeof chunk === "string") {
+            process.stdout.write(chunk);
+            bytes.n += Buffer.byteLength(chunk);
+          } else {
+            const buf = Buffer.from(chunk);
+            process.stdout.write(buf);
+            bytes.n += buf.length;
+          }
+        }
+      };
+      const drainErr = async () => {
+        for await (const chunk of proc.stderr) {
+          const text = typeof chunk === "string" ? chunk : new TextDecoder().decode(chunk);
+          stderrText += text;
+        }
+      };
+
+      await Promise.all([drainOut(), drainErr(), proc.wait()]);
+      offset += bytes.n;
+      logOpenFailures = 0;
+
+      if (stderrText.trim()) {
+        logWarn("Looper", `Log tail stderr: ${stderrText.trim()}`);
+      }
+
       exitCode = await readExitCode(sandbox);
     } catch (err) {
       logWarn("Looper", "Log stream interrupted; retrying...", err);
