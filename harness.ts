@@ -1196,7 +1196,7 @@ export class LongRunningHarness {
   }
 
   private getSpecAuditLenses(): string[] {
-    return ["spec", "integration-testing", "correctness", "safety", "maintainability"];
+    return ["spec", "production-readiness", "correctness", "safety", "maintainability"];
   }
 
   private async getNextSpecAuditLens(): Promise<string> {
@@ -1896,7 +1896,7 @@ Your job: decide how many reviewers (1-${maxAreas}) are needed and define
 non-overlapping functional areas to audit. Use fewer areas for small codebases.
 If you need more context, inspect the repo (git ls-files, rg, ls).
 This audit's lens is "${auditLens}". Use ONLY this lens for every area.
-Lens options: spec, integration-testing, correctness, safety, maintainability.
+Lens options: spec, production-readiness, correctness, safety, maintainability.
 
 OUTPUT FORMAT (MACHINE READABLE ONLY):
 Return EXACTLY one block with valid JSON between the markers. Do not include any other text.
@@ -1908,7 +1908,7 @@ Schema:
       "id": "kebab-case-id",
       "title": "Area name",
       "focus": "What to review in this area",
-      "lens": "spec|integration-testing|correctness|safety|maintainability",
+      "lens": "spec|production-readiness|correctness|safety|maintainability",
       "paths": ["optional/path", "optional/glob"],
       "rationale": "why this area matters"
     }
@@ -1944,7 +1944,7 @@ Relevant paths: ${paths || "(none specified)"}
 
 Audit this area using the lens above. Lens guide:
 - spec: does code match the spec? missing features, deviations from requirements, incomplete implementations
-- integration-testing: cross-component flows, realistic scenarios, missing integration tests
+- production-readiness: leftover mocks/stubs, commented-out code, debug flags, wrong defaults, dev-only safeguards
 - correctness: bugs, edge cases, test coverage gaps
 - safety: security + reliability (input validation, auth, data exposure, failure handling)
 - maintainability: refactor needs, docs/observability debt, unclear boundaries, perf smells
@@ -1956,7 +1956,7 @@ How to audit:
 - Check for TODO/FIXME markers indicating incomplete work
 - Look at recent git history for context
 - Identify missing integration tests relevant to the area and lens
-- If lens=integration-testing, prioritize new integration test tasks and run available integration tests
+- If lens=production-readiness, search for mock/stub/fake patterns, TODO/FIXME/HACK, hardcoded dev values, disabled features
 
 Evidence requirements:
 - Cite specific file:line for code issues
@@ -2071,7 +2071,7 @@ ${this.cfg.projectSpec.trim()}
 
 Your job:
 - Verify the repo matches the spec, but focus this audit on a single lens.
-- Lens options: spec, integration-testing, correctness, safety, maintainability.
+- Lens options: spec, production-readiness, correctness, safety, maintainability.
 - This audit lens is "${auditLens}". Apply it thoroughly; do not try to cover all lenses.
 - Run relevant checks (init.sh, tests) when available.
 - If gaps exist, add new tasks to task_list.json.
