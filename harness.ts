@@ -1266,6 +1266,12 @@ Your job:
 - Order tasks logically (dependencies first)
 - Be specific: reference actual files/directories you find in the codebase
 
+CRITICAL task design rules:
+- Every task must make CONCRETE progress (write code, fix a bug, add a feature)
+- Every investigation should also include the required fixes
+- Each task must be completable on its own - if tests are failing, the task should FIX them
+- The first task should be something that can actually be completed and make tests pass
+
 Task requirements:
 - id: kebab-case identifier
 - category: one of functional|api|ui|infra|test|security|performance|docs|bug|refactor|reliability|observability|ux
