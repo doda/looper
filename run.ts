@@ -65,6 +65,8 @@ interface Config {
   prompts?: LongRunningHarnessConfig["prompts"];
   continuous?: boolean;
   specAuditMaxAreas?: number;
+  runInstruction?: string;
+  runInstructionMaxTasks?: number;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -162,7 +164,8 @@ async function syncCredentialsIfAvailable(oauthFile: string): Promise<boolean> {
 
 /** Validate config and exit if invalid. */
 function validateConfig(config: Config): { primaryAgent: "claude" | "codex"; reviewAgent: "claude" | "codex"; enableReviewAgent: boolean } {
-  if (!config.projectName || !config.instruction) {
+  // --run-instruction mode doesn't require --instruction (project spec)
+  if (!config.projectName || (!config.instruction && !config.runInstruction)) {
     printUsage();
     process.exit(1);
   }
@@ -355,6 +358,8 @@ async function runInModal() {
       MAX_SESSIONS: String(config.sessions),
       ...(config.continuous ? { LOOPER_CONTINUOUS: "1" } : {}),
       ...(config.specAuditMaxAreas ? { LOOPER_SPEC_AUDIT_MAX_AREAS: String(config.specAuditMaxAreas) } : {}),
+      ...(config.runInstruction ? { LOOPER_RUN_INSTRUCTION: config.runInstruction } : {}),
+      ...(config.runInstructionMaxTasks ? { LOOPER_RUN_INSTRUCTION_MAX_TASKS: String(config.runInstructionMaxTasks) } : {}),
       MODEL: config.model,
       LOOPER_STOP_FILE: STOP_FILE_PATH,
       LOOPER_IDLE_TIMEOUT_SECS: String(config.idleTimeoutSecs),
@@ -1082,6 +1087,9 @@ async function runHarness() {
   const continuous = process.env.LOOPER_CONTINUOUS === "1";
   const specAuditMaxAreasRaw = parseInt(process.env.LOOPER_SPEC_AUDIT_MAX_AREAS ?? "", 10);
   const specAuditMaxAreas = Number.isFinite(specAuditMaxAreasRaw) ? specAuditMaxAreasRaw : undefined;
+  const runInstruction = process.env.LOOPER_RUN_INSTRUCTION;
+  const runInstructionMaxTasksRaw = parseInt(process.env.LOOPER_RUN_INSTRUCTION_MAX_TASKS ?? "", 10);
+  const runInstructionMaxTasks = Number.isFinite(runInstructionMaxTasksRaw) ? runInstructionMaxTasksRaw : undefined;
 
   const projectSpec = await fs.readFile(specFile, "utf8");
 
@@ -1136,6 +1144,9 @@ async function runHarness() {
       "Harness",
       `Audit: maxAreas=${specAuditMaxAreas ?? 10}`
     );
+  }
+  if (runInstruction) {
+    logInfo("Harness", `Run instruction: ${runInstruction}`);
   }
 
   await fs.rm(stopFilePath, { force: true });
@@ -1198,7 +1209,15 @@ async function runHarness() {
   process.on("SIGINT", handleSigint);
 
   try {
-    await harness.runUntilDone(maxSessions);
+    if (runInstruction) {
+      logInfo("Harness", `Running instruction: ${runInstruction}`);
+      await harness.runInstruction(runInstruction, {
+        maxTasks: runInstructionMaxTasks,
+        startWork: true,
+      });
+    } else {
+      await harness.runUntilDone(maxSessions);
+    }
     logInfo("Harness", "Harness completed successfully, exiting.");
     process.exit(0);
   } catch (err) {
@@ -1280,6 +1299,8 @@ async function parseArgs(): Promise<Config> {
       case "--codex-model": config.codexModel = args[++i]; break;
       case "--continuous": config.continuous = true; break;
       case "--spec-audit-max-areas": config.specAuditMaxAreas = parseInt(args[++i], 10); break;
+      case "--run-instruction": config.runInstruction = args[++i]; break;
+      case "--run-instruction-max-tasks": config.runInstructionMaxTasks = parseInt(args[++i], 10); break;
       case "-h": case "--help": printUsage(); process.exit(0);
       default:
         if (!arg.startsWith("-") && !config.projectName) {
@@ -1291,6 +1312,11 @@ async function parseArgs(): Promise<Config> {
 
   if (instructionFile && !config.instruction) {
     config.instruction = await fs.readFile(instructionFile, "utf8");
+  }
+
+  // When using --run-instruction without --instruction, provide a placeholder spec
+  if (config.runInstruction && !config.instruction) {
+    config.instruction = `(Running one-off instruction: ${config.runInstruction})`;
   }
 
   if (promptsFile) {

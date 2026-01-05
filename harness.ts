@@ -269,6 +269,16 @@ interface SpecAuditSynthesis {
   summary?: string[];
 }
 
+export interface RunInstructionOptions {
+  maxTasks?: number;
+  startWork?: boolean;
+}
+
+interface InstructionExpansion {
+  tasks: TaskSpec[];
+  notes?: string[];
+}
+
 interface SessionResult {
   sessionId: string | null;
   success: boolean;
@@ -1082,6 +1092,266 @@ export class LongRunningHarness {
   }
 
   /**
+   * Run a spec audit for a specific lens, inserting new tasks at the next position
+   * (after the first incomplete task) and then work on them.
+   */
+  async runSpecAuditForLens(lens: string): Promise<{ addedTasks: number }> {
+    const validLenses = this.getSpecAuditLenses();
+    if (!validLenses.includes(lens)) {
+      throw new Error(`Invalid lens "${lens}". Valid lenses: ${validLenses.join(", ")}`);
+    }
+
+    logInfo("audit", `Starting spec audit for lens: ${lens}`);
+    const reviewAgent = this.getReviewAgent();
+
+    let addedTasks = 0;
+
+    if (this.isCodexPrimary()) {
+      if (!(await this.hasCodexCredentials())) {
+        logInfo("audit", "Codex credentials not available; skipping audit in codex-only mode.");
+        return { addedTasks: 0 };
+      }
+      try {
+        addedTasks = (await this.runCodexSpecAuditWithInsert(lens)).addedTasks;
+      } catch (err) {
+        logInfo(
+          "audit",
+          `Codex audit failed (codex-only): ${err instanceof Error ? err.message : String(err)}`
+        );
+        return { addedTasks: 0 };
+      }
+    } else if (reviewAgent === "claude") {
+      addedTasks = (await this.runClaudeSpecAuditWithInsert(lens)).addedTasks;
+    } else if (!(await this.hasCodexCredentials())) {
+      logInfo("audit", "Codex credentials not available; falling back to Claude audit.");
+      addedTasks = (await this.runClaudeSpecAuditWithInsert(lens)).addedTasks;
+    } else {
+      try {
+        addedTasks = (await this.runCodexSpecAuditWithInsert(lens)).addedTasks;
+      } catch (err) {
+        logInfo(
+          "audit",
+          `Codex audit failed: ${err instanceof Error ? err.message : String(err)}`
+        );
+        try {
+          addedTasks = (await this.runClaudeSpecAuditWithInsert(lens)).addedTasks;
+        } catch (fallbackErr) {
+          logInfo(
+            "audit",
+            `Claude audit fallback failed: ${fallbackErr instanceof Error ? fallbackErr.message : String(fallbackErr)}`
+          );
+          return { addedTasks: 0 };
+        }
+      }
+    }
+
+    if (addedTasks > 0) {
+      logInfo("audit", `Audit added ${addedTasks} task(s) at next position; starting work...`);
+      await this.runUntilDone(addedTasks);
+    } else {
+      logInfo("audit", "Audit completed with no new tasks.");
+    }
+
+    return { addedTasks };
+  }
+
+  /**
+   * Run a one-off instruction by expanding it into tasks and working on them.
+   * This is a general-purpose way to tell the harness "do this thing" without
+   * going through the planning or audit flows.
+   */
+  async runInstruction(
+    instruction: string,
+    options: RunInstructionOptions = {}
+  ): Promise<{ addedTasks: number }> {
+    const { maxTasks = 10, startWork = true } = options;
+
+    await this.ensureInitialized();
+    logInfo("instruction", `Expanding instruction: ${instruction}`);
+
+    const repoSummary = await this.buildRepoSummary();
+    let expansion: InstructionExpansion;
+
+    if (this.isCodexPrimary()) {
+      if (!(await this.hasCodexCredentials())) {
+        logInfo("instruction", "Codex credentials not available; using Claude.");
+        expansion = await this.expandInstructionWithClaude(instruction, maxTasks, repoSummary);
+      } else {
+        try {
+          expansion = await this.expandInstructionWithCodex(instruction, maxTasks, repoSummary);
+        } catch (err) {
+          logInfo(
+            "instruction",
+            `Codex expansion failed: ${err instanceof Error ? err.message : String(err)}`
+          );
+          expansion = await this.expandInstructionWithClaude(instruction, maxTasks, repoSummary);
+        }
+      }
+    } else {
+      expansion = await this.expandInstructionWithClaude(instruction, maxTasks, repoSummary);
+    }
+
+    const addedTasks = await this.applyInstructionTasks(expansion.tasks, instruction);
+
+    if (expansion.notes?.length) {
+      logInfo("instruction", `Notes: ${expansion.notes.join("; ")}`);
+    }
+
+    if (addedTasks > 0 && startWork) {
+      logInfo("instruction", `Added ${addedTasks} task(s); starting work...`);
+      await this.runUntilDone(addedTasks);
+    } else if (addedTasks > 0) {
+      logInfo("instruction", `Added ${addedTasks} task(s) to task list.`);
+    } else {
+      logInfo("instruction", "No tasks generated from instruction.");
+    }
+
+    return { addedTasks };
+  }
+
+  private async expandInstructionWithCodex(
+    instruction: string,
+    maxTasks: number,
+    repoSummary: string
+  ): Promise<InstructionExpansion> {
+    const nonce = randomUUID();
+    const prompt = this.buildInstructionExpansionPrompt(instruction, maxTasks, repoSummary, nonce);
+    const output = await this.execCodexPrompt(
+      prompt,
+      "instruction",
+      this.cfg.specAuditModel ?? this.cfg.codexModel
+    );
+    const json = this.extractCodexJson(output, "INSTRUCTION_TASKS", nonce);
+    return JSON.parse(json) as InstructionExpansion;
+  }
+
+  private async expandInstructionWithClaude(
+    instruction: string,
+    maxTasks: number,
+    repoSummary: string
+  ): Promise<InstructionExpansion> {
+    const nonce = randomUUID();
+    const prompt = this.buildInstructionExpansionPrompt(instruction, maxTasks, repoSummary, nonce);
+
+    const options: Options = {
+      ...this.buildBaseOptions("instruction"),
+      maxTurns: 1,
+      permissionMode: "bypassPermissions",
+      allowDangerouslySkipPermissions: true,
+      ...this.cfg.sdkOptionsOverride,
+    };
+
+    const output = await this.runQueryWithMessages(prompt, options, "instruction");
+    const json = this.extractCodexJson(output, "INSTRUCTION_TASKS", nonce);
+    return JSON.parse(json) as InstructionExpansion;
+  }
+
+  private buildInstructionExpansionPrompt(
+    instruction: string,
+    maxTasks: number,
+    repoSummary: string,
+    nonce: string
+  ): string {
+    return `You are analyzing a codebase to create tasks for the following instruction:
+
+INSTRUCTION:
+${instruction}
+
+${repoSummary}
+
+Your job:
+- Analyze the codebase to understand its structure (use git ls-files, read key files)
+- Break down the instruction into ${maxTasks} or fewer concrete, actionable tasks
+- Each task should be independently completable by an AI coding agent
+- Order tasks logically (dependencies first)
+- Be specific: reference actual files/directories you find in the codebase
+
+Task requirements:
+- id: kebab-case identifier
+- category: one of functional|api|ui|infra|test|security|performance|docs|bug|refactor|reliability|observability|ux
+- description: one clear sentence
+- steps: 2-5 specific steps to complete the task
+- depends_on: optional array of task ids this depends on
+- scope: optional array of file paths this task will touch
+
+OUTPUT FORMAT (MACHINE READABLE ONLY):
+Return EXACTLY one block with valid JSON between the markers. Do not include any other text.
+
+Schema:
+{
+  "tasks": [
+    {
+      "id": "task-id",
+      "category": "docs",
+      "description": "What this task accomplishes",
+      "steps": ["Step 1", "Step 2"],
+      "depends_on": [],
+      "scope": ["path/to/file"]
+    }
+  ],
+  "notes": ["optional observations about the codebase"]
+}
+
+<<<INSTRUCTION_TASKS:${nonce}>>>
+{"tasks":[],"notes":[]}
+<<<END_INSTRUCTION_TASKS:${nonce}>>>`;
+  }
+
+  private async applyInstructionTasks(
+    tasks: TaskSpec[],
+    instruction: string
+  ): Promise<number> {
+    const taskList = await this.readTaskList();
+    const keyOrder = taskList.length > 0 ? Object.keys(taskList[0]) : undefined;
+    const existingIds = new Set(taskList.map((t) => t.id));
+    const normalizedTasks: TaskSpec[] = [];
+
+    for (const rawTask of tasks) {
+      const normalized = this.normalizeNewTask(rawTask, keyOrder, false);
+      if (!normalized) continue;
+      let id = normalized.id;
+      if (existingIds.has(id)) {
+        let suffix = 2;
+        while (existingIds.has(`${id}-${suffix}`)) suffix += 1;
+        id = `${id}-${suffix}`;
+      }
+      normalized.id = id;
+      normalizedTasks.push(normalized);
+      existingIds.add(id);
+    }
+
+    if (normalizedTasks.length === 0) return 0;
+
+    // Insert before first incomplete task so new tasks are worked on next
+    const insertIndex = taskList.findIndex((t) => t.completed !== true);
+    if (insertIndex !== -1) {
+      taskList.splice(insertIndex, 0, ...normalizedTasks);
+    } else {
+      taskList.push(...normalizedTasks);
+    }
+
+    const shortInstruction = instruction.length > 50 ? instruction.slice(0, 50) + "..." : instruction;
+    const progressEntry = `[${new Date().toISOString()}] Instruction: "${shortInstruction}" -> ${normalizedTasks.length} task(s)\n`;
+
+    await fs.writeFile(this.paths.taskList, JSON.stringify(taskList, null, 2) + "\n");
+    await fs.appendFile(this.paths.progressLog, progressEntry, "utf8");
+
+    const env = this.buildGitEnv();
+    await this.ensureGitIdentity(env);
+    await execFileAsync("git", ["-C", this.workingDir, "add", "task_list.json", "agent-progress.txt"], { env });
+
+    const status = await execFileAsync("git", ["-C", this.workingDir, "status", "--porcelain"], { env });
+    if (status.stdout.trim()) {
+      const message = `Instruction: ${normalizedTasks.length} task(s)`;
+      await execFileAsync("git", ["-C", this.workingDir, "commit", "-m", message], { env });
+    }
+
+    await this.pushIfNeeded("instruction");
+
+    return normalizedTasks.length;
+  }
+
+  /**
    * Run a Codex-driven audit when all tasks are passing.
    * Returns counts of new tasks.
    */
@@ -1153,6 +1423,103 @@ export class LongRunningHarness {
     return { addedTasks };
   }
 
+  /**
+   * Run a Codex-driven audit for a specific lens, inserting tasks after the first incomplete task.
+   */
+  private async runCodexSpecAuditWithInsert(auditLens: string): Promise<{ addedTasks: number }> {
+    const maxAreas = Math.max(1, this.cfg.specAuditMaxAreas ?? 10);
+    const repoSummary = await this.buildRepoSummary();
+
+    const plan = await this.runCodexSpecAuditPlan(maxAreas, repoSummary, auditLens);
+    const areas = this.sanitizeSpecAuditAreas(plan.areas, maxAreas, auditLens);
+    this.logSpecAuditPlan(plan, areas);
+
+    const areaResults = await this.runSpecAuditAreas(areas, repoSummary);
+    this.logSpecAuditAreaResults(areaResults);
+    const taskListRaw = await fs.readFile(this.paths.taskList, "utf8");
+    const synthesis = await this.runCodexSpecAuditSynthesis(
+      plan,
+      areas,
+      areaResults,
+      taskListRaw,
+      repoSummary
+    );
+    this.logSpecAuditSynthesis(synthesis);
+
+    const { addedTasks } = await this.applySpecAuditResults(
+      synthesis,
+      areas.length,
+      auditLens,
+      true // insertAfterFirstIncomplete
+    );
+
+    await this.pushIfNeeded("audit");
+
+    return { addedTasks };
+  }
+
+  /**
+   * Run a Claude-driven audit for a specific lens, inserting tasks after the first incomplete task.
+   */
+  private async runClaudeSpecAuditWithInsert(auditLens: string): Promise<{ addedTasks: number }> {
+    const before = await this.readTaskList();
+    const options: Options = {
+      ...this.buildBaseOptions("audit"),
+      maxTurns: this.cfg.maxReviewTurns ?? DEFAULT_MAX_AUDIT_TURNS,
+      permissionMode: "bypassPermissions",
+      allowDangerouslySkipPermissions: true,
+      ...this.cfg.sdkOptionsOverride,
+    };
+
+    await this.runQuery(this.buildSpecAuditClaudePromptWithInsert(auditLens), options, "audit");
+
+    const after = await this.readTaskList();
+    const { addedTasks } = this.countTaskChanges(before, after);
+
+    // Claude may have appended tasks; reorder to insert after first incomplete
+    if (addedTasks > 0) {
+      await this.reorderNewTasksAfterFirstIncomplete(before, after);
+    }
+
+    await this.pushIfNeeded("audit");
+    return { addedTasks };
+  }
+
+  /**
+   * Reorder task list so new tasks appear before the first incomplete task.
+   */
+  private async reorderNewTasksAfterFirstIncomplete(
+    before: TaskList,
+    after: TaskList
+  ): Promise<void> {
+    const beforeIds = new Set(before.map((t) => t.id));
+    const newTasks = after.filter((t) => !beforeIds.has(t.id));
+    const existingTasks = after.filter((t) => beforeIds.has(t.id));
+
+    if (newTasks.length === 0) return;
+
+    const insertIndex = existingTasks.findIndex((t) => t.completed !== true);
+    const reordered: TaskList = [];
+
+    if (insertIndex === -1) {
+      reordered.push(...existingTasks, ...newTasks);
+    } else {
+      reordered.push(...existingTasks.slice(0, insertIndex));
+      reordered.push(...newTasks);
+      reordered.push(...existingTasks.slice(insertIndex));
+    }
+
+    await fs.writeFile(this.paths.taskList, JSON.stringify(reordered, null, 2) + "\n");
+
+    const env = this.buildGitEnv();
+    await this.ensureGitIdentity(env);
+    await execFileAsync("git", ["-C", this.workingDir, "add", "task_list.json"], { env });
+    const status = await execFileAsync("git", ["-C", this.workingDir, "status", "--porcelain"], { env });
+    if (status.stdout.trim()) {
+      await execFileAsync("git", ["-C", this.workingDir, "commit", "-m", "Reorder audit tasks"], { env });
+    }
+  }
+
   private async hasCodexCredentials(): Promise<boolean> {
     if (process.env.CODEX_CREDENTIALS_JSON) return true;
     const home = process.env.HOME ?? "/home/looper";
@@ -1196,7 +1563,7 @@ export class LongRunningHarness {
   }
 
   private getSpecAuditLenses(): string[] {
-    return ["spec", "production-readiness", "correctness", "safety", "maintainability"];
+    return ["spec", "production-readiness", "correctness", "safety", "maintainability", "performance", "docs"];
   }
 
   private async getNextSpecAuditLens(): Promise<string> {
@@ -1328,12 +1695,13 @@ export class LongRunningHarness {
   private async applySpecAuditResults(
     synthesis: SpecAuditSynthesis,
     areaCount: number,
-    auditLens: string
+    auditLens: string,
+    insertAfterFirstIncomplete = false
   ): Promise<{ addedTasks: number }> {
     const taskList = await this.readTaskList();
     const keyOrder = taskList.length > 0 ? Object.keys(taskList[0]) : undefined;
     const existingIds = new Set(taskList.map((task) => task.id));
-    let addedTasks = 0;
+    const normalizedTasks: TaskSpec[] = [];
 
     const newTasks = Array.isArray(synthesis.new_tasks) ? synthesis.new_tasks : [];
     for (const rawTask of newTasks) {
@@ -1346,10 +1714,23 @@ export class LongRunningHarness {
         id = `${id}-${suffix}`;
       }
       normalized.id = id;
-      taskList.push(normalized);
+      normalizedTasks.push(normalized);
       existingIds.add(id);
-      addedTasks += 1;
     }
+
+    if (insertAfterFirstIncomplete && normalizedTasks.length > 0) {
+      // Insert before first incomplete task so new tasks are worked on next
+      const insertIndex = taskList.findIndex((t) => t.completed !== true);
+      if (insertIndex !== -1) {
+        taskList.splice(insertIndex, 0, ...normalizedTasks);
+      } else {
+        taskList.push(...normalizedTasks);
+      }
+    } else {
+      taskList.push(...normalizedTasks);
+    }
+
+    const addedTasks = normalizedTasks.length;
 
     const summaryBits = [
       synthesis.result ? synthesis.result.toUpperCase() : "UNKNOWN",
@@ -1899,7 +2280,7 @@ Your job: decide how many reviewers (1-${maxAreas}) are needed and define
 non-overlapping functional areas to audit. Use fewer areas for small codebases.
 If you need more context, inspect the repo (git ls-files, rg, ls).
 This audit's lens is "${auditLens}". Use ONLY this lens for every area.
-Lens options: spec, production-readiness, correctness, safety, maintainability.
+Lens options: spec, production-readiness, correctness, safety, maintainability, performance, docs.
 
 OUTPUT FORMAT (MACHINE READABLE ONLY):
 Return EXACTLY one block with valid JSON between the markers. Do not include any other text.
@@ -1911,7 +2292,7 @@ Schema:
       "id": "kebab-case-id",
       "title": "Area name",
       "focus": "What to review in this area",
-      "lens": "spec|production-readiness|correctness|safety|maintainability",
+      "lens": "spec|production-readiness|correctness|safety|maintainability|performance|docs",
       "paths": ["optional/path", "optional/glob"],
       "rationale": "why this area matters"
     }
@@ -1950,7 +2331,9 @@ Audit this area using the lens above. Lens guide:
 - production-readiness: leftover mocks/stubs, commented-out code, debug flags, wrong defaults, dev-only safeguards
 - correctness: bugs, edge cases, test coverage gaps
 - safety: security + reliability (input validation, auth, data exposure, failure handling)
-- maintainability: refactor needs, docs/observability debt, unclear boundaries, perf smells
+- maintainability: refactor needs, docs/observability debt, unclear boundaries
+- performance: algorithmic complexity, memory leaks, resource exhaustion, N+1 queries, missing caching, latency bottlenecks
+- docs: missing/outdated README, inline docs, API docs, setup instructions, architecture docs, user guides
 If the lens doesn't apply, say so in notes and still report clear issues you find.
 
 How to audit:
@@ -2074,7 +2457,7 @@ ${this.cfg.projectSpec.trim()}
 
 Your job:
 - Verify the repo matches the spec, but focus this audit on a single lens.
-- Lens options: spec, production-readiness, correctness, safety, maintainability.
+- Lens options: spec, production-readiness, correctness, safety, maintainability, performance, docs.
 - This audit lens is "${auditLens}". Apply it thoroughly; do not try to cover all lenses.
 - Run relevant checks (init.sh, tests) when available.
 - If gaps exist, add new tasks to task_list.json.
@@ -2096,6 +2479,10 @@ At the end:
   resolved them (or note unresolved). Include a line with lens=${auditLens}.
 - Commit changes with a message like "Audit: <brief summary>".
 `;
+  }
+
+  private buildSpecAuditClaudePromptWithInsert(auditLens: string): string {
+    return this.buildSpecAuditClaudePrompt(auditLens);
   }
 
   /**
@@ -2201,6 +2588,31 @@ At the end:
         `[${phase}] SDK query failed (${lastResult.subtype}): ${errorMsg}`
       );
     }
+  }
+
+  private async runQueryWithMessages(
+    prompt: string,
+    options: Options,
+    phase: HarnessPhase
+  ): Promise<string> {
+    const stream = query({ prompt, options });
+    const textParts: string[] = [];
+
+    for await (const msg of stream) {
+      this.defaultLogMessage(msg, phase);
+      this.cfg.onMessage?.(msg, phase);
+
+      if (msg.type === "assistant") {
+        const content = (msg.message as any).content ?? [];
+        for (const block of content) {
+          if (block?.type === "text" && typeof block.text === "string") {
+            textParts.push(block.text);
+          }
+        }
+      }
+    }
+
+    return textParts.join("\n");
   }
 
   private async runCodexAgentPrompt(
