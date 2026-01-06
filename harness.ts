@@ -1657,8 +1657,11 @@ export class LongRunningHarness {
             : null;
         if (!content) return null;
         const parts = content
-          .map((block) => (block?.type === "text" && typeof block.text === "string" ? block.text : null))
-          .filter((text): text is string => Boolean(text));
+          .map((block: unknown): string | null => {
+            const b = block as { type?: string; text?: unknown };
+            return b?.type === "text" && typeof b.text === "string" ? b.text : null;
+          })
+          .filter((text: string | null): text is string => Boolean(text));
         if (parts.length === 0) return null;
         return parts.join("\n");
       };
