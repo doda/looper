@@ -62,8 +62,8 @@ export interface LongRunningHarnessConfig {
 
   /**
    * Primary agent for planning and working sessions.
-   * - "claude": Use Claude Agent SDK (default)
-   * - "codex": Use OpenAI Codex CLI
+   * - "claude": Use Claude Agent SDK
+   * - "codex": Use OpenAI Codex CLI (default)
    */
   primaryAgent?: "claude" | "codex";
 
