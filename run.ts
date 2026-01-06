@@ -1341,21 +1341,22 @@ Options:
   --instruction <text>     Project spec as string
   --instruction-file <f>   Path to spec file
   --prompts-file <f>       Path to JSON file with prompt overrides (for non-code domains)
-  --sessions <n>           Working sessions (default: unlimited if 0)
-  --cpu <cores>            CPU cores (default: 4.0)
-  --memory <mb>            Memory MB (default: 16384)
-  --timeout <secs>         Timeout seconds (default: none if 0)
+  --sessions <n>           Working sessions (default: unlimited)
+  --cpu <cores>            CPU cores (default: 2.0)
+  --memory <mb>            Memory MB (default: 4096)
+  --timeout <secs>         Timeout seconds (default: 24h)
   --idle-timeout <secs>    Idle timeout seconds (default: 300)
-  --continuous             After tasks are completed, run a Codex audit and continue if new tasks are added
-  --spec-audit-max-areas <n> Max audit areas/reviewers (default: 10)
   --repo-url <url>         GitHub repo URL
   --branch <branch>        Git branch (default: main)
-  --model <model>          Claude model: opus, sonnet, etc. (default: opus)
+  --model <model>          Claude model: opus, sonnet (default: opus)
   --primary-agent <agent>  Primary agent: claude, codex (default: codex)
-  --claude-oauth-file <f>  Path to Claude Code OAuth credentials JSON (default: ./.claude-code-credentials.json)
-  --review-agent <agent>   Code review agent: claude, codex (default: codex)
-  --codex-model <model>    Codex CLI model for review (default: codex's default)
-  --enable-review          Enable review agent ping-pong (default: off)
+  --enable-review          Enable review agent ping-pong
+  --review-agent <agent>   Review agent: claude, codex (default: codex)
+  --codex-model <model>    Codex CLI model for work/review
+  --continuous             Run audit when tasks complete, add new work
+  --spec-audit-max-areas <n> Max audit areas (default: 10)
+  --claude-oauth-file <f>  Claude Code OAuth credentials JSON
+  --terminate              Terminate existing sandbox for this project
 
 Environment:
   GITHUB_OWNER             Derive repo URL from owner + project name

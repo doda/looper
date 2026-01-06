@@ -141,6 +141,7 @@ Options:
   --codex-model <model>      Codex CLI model for work/review
   --continuous               Run audit when tasks are completed, add new work
   --spec-audit-max-areas <n> Max audit areas (default: 10)
+  --claude-oauth-file <f>    Claude Code OAuth credentials JSON
   --terminate                Terminate existing sandbox for this project
 ```
 
@@ -241,11 +242,12 @@ interface LongRunningHarnessConfig {
   primaryAgent?: "claude" | "codex";  // Primary agent (default: codex)
   reviewAgent?: "claude" | "codex";   // Review agent (default: codex)
   enableReviewAgent?: boolean;        // Enable ping-pong review
+  codexModel?: string;                // Codex CLI model for work/review
 
   // Session limits
   maxPlanningTurns?: number;     // Max turns for planning
   maxWorkingTurns?: number;      // Max turns per working session
-  maxReviewIterations?: number;  // Max review rounds (default: 3)
+  maxReviewIterations?: number;  // Max review rounds (default: 5)
   maxReviewTurns?: number;       // Max turns per review
 
   // Continuous audit
@@ -257,6 +259,8 @@ interface LongRunningHarnessConfig {
   useProjectSettings?: boolean;  // Load CLAUDE.md (default: true)
   mcpServers?: Options["mcpServers"];
   sdkOptionsOverride?: Partial<Options>;
+  onMessage?: (msg: SDKMessage, phase: HarnessPhase) => void;  // Streaming callback
+  stopFilePath?: string;         // Stop-after-session sentinel file
 
   // Domain customization
   prompts?: {
